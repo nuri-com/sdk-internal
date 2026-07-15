@@ -9,11 +9,36 @@
 //! envelope or data envelope) instead.
 
 use crate::CryptoError;
+#[allow(dead_code)]
+pub(crate) mod aes256_cbc;
+
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SymmetricEncryptionError {
+    /// The input is malformed — wrong length, invalid padding, or otherwise not a valid
+    /// ciphertext for the cipher.
+    FormatWrong,
+    /// The integrity check (MAC / authentication tag) failed; the ciphertext, associated data,
+    /// nonce/IV, and key do not match.
+    IntegrityCheckFailed,
+}
+
+impl From<SymmetricEncryptionError> for CryptoError {
+    fn from(_: SymmetricEncryptionError) -> Self {
+        CryptoError::KeyDecrypt
+    }
+}
+#[allow(dead_code)]
+pub(crate) mod aes256_cbc_hmac_sha256_ad;
 pub(crate) mod aes_gcm;
 pub(crate) mod xchacha20;
 
 #[allow(unused_imports)]
 pub(crate) use aes_gcm::Aes256Gcm;
+#[allow(unused_imports)]
+pub(crate) use aes256_cbc::Aes256Cbc;
+#[allow(unused_imports)]
+pub(crate) use aes256_cbc_hmac_sha256_ad::Aes256CbcHmacSha256;
 #[allow(unused_imports)]
 pub(crate) use xchacha20::XChaCha20Poly1305;
 

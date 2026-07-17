@@ -5,7 +5,10 @@ use bitwarden_crypto::CryptoError;
 use bitwarden_vault::{CipherError, CipherView, EncryptionContext};
 use itertools::Itertools;
 use passkey::{
-    authenticator::{Authenticator, DiscoverabilitySupport, StoreInfo, UiHint, UserCheck},
+    authenticator::{
+        Authenticator, DiscoverabilitySupport, StoreInfo, UiHint, UserCheck,
+        extensions::HmacSecretConfig,
+    },
     types::{
         Passkey,
         ctap2::{self, Ctap2Error, StatusCode, VendorError},
@@ -301,7 +304,7 @@ impl<'a> Fido2Authenticator<'a> {
         &self,
         create_credential: bool,
     ) -> Authenticator<CredentialStoreImpl<'_>, UserValidationMethodImpl<'_>> {
-        Authenticator::new(
+        let authenticator = Authenticator::new(
             AAGUID,
             CredentialStoreImpl {
                 authenticator: self,
@@ -310,6 +313,16 @@ impl<'a> Fido2Authenticator<'a> {
             UserValidationMethodImpl {
                 authenticator: self,
             },
+        );
+
+        // Enable PRF/hmac-secret extension on both make_credential and get_assertion.
+        // Setting the config enables on-demand PRF evaluation on get_assertion
+        // (get_prf only checks that the config is present). enable_on_make_credential
+        // additionally gates PRF output during make_credential.
+        // new_without_uv() configures support for both UV and non-UV seeds.
+        authenticator.hmac_secret(
+            HmacSecretConfig::new_without_uv()
+                .enable_on_make_credential(),
         )
     }
 
@@ -695,7 +708,7 @@ mod tests {
     use bitwarden_encoding::B64Url;
     use bitwarden_vault::{
         CipherListView, CipherRepromptType, CipherType, CipherView, EncryptionContext,
-        Fido2Credential, Fido2CredentialNewView, LoginView,
+        Fido2Credential, Fido2CredentialNewView, Fido2ExtensionStateView, LoginView,
     };
     use passkey::authenticator::UiHint;
 
@@ -790,8 +803,21 @@ mod tests {
     ];
 
     fn create_test_cipher(ctx: &mut KeyStoreContext<KeySlotIds>) -> CipherView {
+        create_test_cipher_with_extension(ctx, None)
+    }
+
+    fn create_test_cipher_with_extension(
+        ctx: &mut KeyStoreContext<KeySlotIds>,
+        extension_state: Option<Fido2ExtensionStateView>,
+    ) -> CipherView {
         let key = SymmetricKeySlotId::User;
         let key_value = B64Url::from(TEST_FIDO_P256_KEY).to_string();
+
+        let extension_state_enc = extension_state
+            .map(|es| {
+                let json = serde_json::to_string(&es).unwrap();
+                json.encrypt(ctx, key).unwrap()
+            });
 
         let fido2_credential = Fido2Credential {
             credential_id: TEST_FIDO_CREDENTIAL_ID.encrypt(ctx, key).unwrap(),
@@ -807,7 +833,7 @@ mod tests {
             user_display_name: None,
             discoverable: "true".to_string().encrypt(ctx, key).unwrap(),
             creation_date: "2024-06-07T14:12:36.150Z".parse().unwrap(),
-            extension_state: None,
+            extension_state: extension_state_enc,
         };
 
         CipherView {
@@ -853,12 +879,81 @@ mod tests {
         }
     }
 
-    /// TODO(PM-30510): Even though we forward the extensions to the
-    /// authenticator, we have disabled the configuration.
-    /// When we implement PRF, this test should be updated to test that PRF _is_
-    /// evaluated when PRF extension input is received.
+    /// PRF is evaluated when the credential has extension_state with HMAC seeds.
     #[tokio::test]
-    async fn test_prf_is_not_evaluated() {
+    async fn test_prf_is_evaluated_with_extension_state() {
+        let client = Client::new(None);
+        let user_key: SymmetricCryptoKey =
+            "w2LO+nwV4oxwswVYCxlOfRUseXfvU03VzvKQHrqeklPgiMZrspUe6sOBToCnDn9Ay0tuCBn8ykVVRb7PWhub2Q=="
+                .to_string()
+                .try_into()
+                .unwrap();
+
+        #[allow(deprecated)]
+        client
+            .internal
+            .get_key_store()
+            .context_mut()
+            .set_symmetric_key(SymmetricKeySlotId::User, user_key)
+            .unwrap();
+
+        // UV seed: 0x11 * 32, non-UV seed: 0x22 * 32
+        let uv_seed = B64Url::from(vec![0x11u8; 32]).to_string();
+        let non_uv_seed = B64Url::from(vec![0x22u8; 32]).to_string();
+        let extension_state = Fido2ExtensionStateView {
+            prf_hmac_algorithm: "hmac-secret".to_string(),
+            uv_hmac_seed: uv_seed,
+            non_uv_hmac_seed: Some(non_uv_seed),
+            cred_blob: None,
+            large_blob: None,
+            key_algorithm_metadata: "ES256".to_string(),
+        };
+
+        let cipher = {
+            let mut ctx = client.internal.get_key_store().context();
+            create_test_cipher_with_extension(&mut ctx, Some(extension_state))
+        };
+
+        let user_interface = MockUserInterface;
+        let credential_store = MockCredentialStore { cipher };
+        let mut authenticator =
+            Fido2Authenticator::new(&client, &user_interface, &credential_store);
+
+        // PRF input: salt = SHA-256("nuri-prf-salt-v1")
+        let prf_salt = passkey::types::crypto::sha256("nuri-prf-salt-v1".as_bytes()).to_vec();
+        let request = GetAssertionRequest {
+            rp_id: "example.com".to_string(),
+            client_data_hash: vec![0u8; 32],
+            allow_list: None,
+            options: Options {
+                rk: false,
+                uv: UV::Preferred,
+            },
+            extensions: Some(GetAssertionExtensionsInput {
+                prf: Some(GetAssertionPrfInput {
+                    eval: Some(PrfInputValues {
+                        first: prf_salt,
+                        second: None,
+                    }),
+                    eval_by_credential: None,
+                }),
+            }),
+        };
+
+        let result = authenticator.get_assertion(request).await.unwrap();
+        assert_eq!(
+            TEST_FIDO_CREDENTIAL_ID,
+            guid_bytes_to_string(&result.credential_id).unwrap()
+        );
+        assert!(
+            result.extensions.prf.is_some(),
+            "PRF should be evaluated when extension_state contains HMAC seeds"
+        );
+    }
+
+    /// PRF is NOT evaluated when the credential has no extension_state (no HMAC seeds).
+    #[tokio::test]
+    async fn test_prf_is_not_evaluated_without_extension_state() {
         let client = Client::new(None);
         let user_key: SymmetricCryptoKey =
             "w2LO+nwV4oxwswVYCxlOfRUseXfvU03VzvKQHrqeklPgiMZrspUe6sOBToCnDn9Ay0tuCBn8ykVVRb7PWhub2Q=="
@@ -910,7 +1005,78 @@ mod tests {
         );
         assert!(
             result.extensions.prf.is_none(),
-            "PRF should not be evaluated"
+            "PRF should not be evaluated when extension_state is absent"
+        );
+    }
+
+    /// PRF is evaluated with only the UV seed (non-UV seed is None).
+    /// This covers credentials created with UV-only HMAC secret config.
+    #[tokio::test]
+    async fn test_prf_is_evaluated_with_uv_only_seed() {
+        let client = Client::new(None);
+        let user_key: SymmetricCryptoKey =
+            "w2LO+nwV4oxwswVYCxlOfRUseXfvU03VzvKQHrqeklPgiMZrspUe6sOBToCnDn9Ay0tuCBn8ykVVRb7PWhub2Q=="
+                .to_string()
+                .try_into()
+                .unwrap();
+
+        #[allow(deprecated)]
+        client
+            .internal
+            .get_key_store()
+            .context_mut()
+            .set_symmetric_key(SymmetricKeySlotId::User, user_key)
+            .unwrap();
+
+        // UV seed only, non-UV seed is None
+        let uv_seed = B64Url::from(vec![0x11u8; 32]).to_string();
+        let extension_state = Fido2ExtensionStateView {
+            prf_hmac_algorithm: "hmac-secret".to_string(),
+            uv_hmac_seed: uv_seed,
+            non_uv_hmac_seed: None,
+            cred_blob: None,
+            large_blob: None,
+            key_algorithm_metadata: "ES256".to_string(),
+        };
+
+        let cipher = {
+            let mut ctx = client.internal.get_key_store().context();
+            create_test_cipher_with_extension(&mut ctx, Some(extension_state))
+        };
+
+        let user_interface = MockUserInterface;
+        let credential_store = MockCredentialStore { cipher };
+        let mut authenticator =
+            Fido2Authenticator::new(&client, &user_interface, &credential_store);
+
+        let prf_salt = passkey::types::crypto::sha256("nuri-prf-salt-v1".as_bytes()).to_vec();
+        let request = GetAssertionRequest {
+            rp_id: "example.com".to_string(),
+            client_data_hash: vec![0u8; 32],
+            allow_list: None,
+            options: Options {
+                rk: false,
+                uv: UV::Preferred,
+            },
+            extensions: Some(GetAssertionExtensionsInput {
+                prf: Some(GetAssertionPrfInput {
+                    eval: Some(PrfInputValues {
+                        first: prf_salt,
+                        second: None,
+                    }),
+                    eval_by_credential: None,
+                }),
+            }),
+        };
+
+        let result = authenticator.get_assertion(request).await.unwrap();
+        assert_eq!(
+            TEST_FIDO_CREDENTIAL_ID,
+            guid_bytes_to_string(&result.credential_id).unwrap()
+        );
+        assert!(
+            result.extensions.prf.is_some(),
+            "PRF should be evaluated when extension_state contains UV-only HMAC seed"
         );
     }
 }

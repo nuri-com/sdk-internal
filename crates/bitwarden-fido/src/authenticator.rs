@@ -807,6 +807,7 @@ mod tests {
             user_display_name: None,
             discoverable: "true".to_string().encrypt(ctx, key).unwrap(),
             creation_date: "2024-06-07T14:12:36.150Z".parse().unwrap(),
+            extension_state: None,
         };
 
         CipherView {

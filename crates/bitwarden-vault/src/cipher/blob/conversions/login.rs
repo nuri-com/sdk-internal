@@ -25,6 +25,10 @@ impl From<&LoginUriDataV1> for LoginUriView {
 
 impl From<&Fido2CredentialFullView> for Fido2CredentialDataV1 {
     fn from(view: &Fido2CredentialFullView) -> Self {
+        let extension_state = view
+            .extension_state
+            .as_ref()
+            .map(|es| serde_json::to_string(es).unwrap_or_default());
         Self {
             credential_id: view.credential_id.clone(),
             key_type: view.key_type.clone(),
@@ -39,12 +43,17 @@ impl From<&Fido2CredentialFullView> for Fido2CredentialDataV1 {
             user_display_name: view.user_display_name.clone(),
             discoverable: view.discoverable == "true",
             creation_date: view.creation_date,
+            extension_state,
         }
     }
 }
 
 impl From<&Fido2CredentialDataV1> for Fido2CredentialFullView {
     fn from(data: &Fido2CredentialDataV1) -> Self {
+        let extension_state = data
+            .extension_state
+            .as_ref()
+            .and_then(|s| serde_json::from_str(s).ok());
         Self {
             credential_id: data.credential_id.clone(),
             key_type: data.key_type.clone(),
@@ -59,6 +68,7 @@ impl From<&Fido2CredentialDataV1> for Fido2CredentialFullView {
             user_display_name: data.user_display_name.clone(),
             discoverable: data.discoverable.to_string(),
             creation_date: data.creation_date,
+            extension_state,
         }
     }
 }
@@ -120,6 +130,7 @@ mod tests {
             user_display_name: None,
             discoverable: "true".to_string(),
             creation_date: Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+            extension_state: None,
         };
 
         let data = super::Fido2CredentialDataV1::from(&full_view);
@@ -147,6 +158,7 @@ mod tests {
             user_display_name: None,
             discoverable: "false".to_string(),
             creation_date: Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+            extension_state: None,
         };
 
         let data = super::Fido2CredentialDataV1::from(&full_view);
@@ -174,6 +186,7 @@ mod tests {
             user_display_name: None,
             discoverable: "true".to_string(),
             creation_date: Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+            extension_state: None,
         };
 
         let data = super::Fido2CredentialDataV1::from(&full_view);
@@ -200,6 +213,7 @@ mod tests {
             user_display_name: Some("Test User".to_string()),
             discoverable: "true".to_string(),
             creation_date: Utc.with_ymd_and_hms(2024, 6, 1, 10, 30, 0).unwrap(),
+            extension_state: None,
         };
         let encrypted_fido2: Fido2Credential =
             fido2_full.encrypt_composite(&mut ctx, key_id).unwrap();

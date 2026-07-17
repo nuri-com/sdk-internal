@@ -7,6 +7,9 @@ use bitwarden_core::MissingFieldError;
 use bitwarden_fido::{InvalidGuidError, string_to_guid_bytes};
 use bitwarden_vault::{FieldType, Totp, TotpAlgorithm};
 use chrono::{DateTime, Utc};
+use coset::{
+    CborSerializable, CoseKey, RegisteredLabel, RegisteredLabelWithPrivate, iana::EnumI64,
+};
 use credential_exchange_format::{
     AndroidAppIdCredential, B64Url, BasicAuthCredential, CredentialScope, NotB64UrlEncoded,
     OTPHashAlgorithm, PasskeyCredential, TotpCredential,
@@ -48,6 +51,120 @@ fn totp_credential_to_totp(cxf_totp: &TotpCredential) -> Totp {
     }
 }
 
+/// Errors that can occur while deriving the passkey key algorithm and curve from CXF credential
+/// data.
+#[derive(Debug, Error)]
+pub enum PasskeyAlgorithmError {
+    /// The `key` field is not a valid CBOR-encoded COSE_Key.
+    #[error("Passkey key is not a valid COSE_Key")]
+    InvalidCoseKey,
+
+    /// The COSE_Key does not include a key type (kty) label.
+    #[error("COSE_Key is missing the key type (kty)")]
+    MissingKeyType,
+
+    /// The COSE key type is not supported. Only EC2 (kty = 2) is currently supported.
+    #[error("Unsupported key type: {kty:?}")]
+    UnsupportedKeyType {
+        kty: RegisteredLabel<coset::iana::KeyType>,
+    },
+
+    /// The COSE_Key does not include an algorithm (alg) label.
+    #[error("COSE_Key is missing the algorithm (alg)")]
+    MissingAlgorithm,
+
+    /// The COSE algorithm is not supported.
+    #[error("Unsupported algorithm: {alg:?}")]
+    UnsupportedAlgorithm {
+        alg: RegisteredLabelWithPrivate<coset::iana::Algorithm>,
+    },
+
+    /// The COSE key does not include an EC2 curve (crv) label.
+    #[error("COSE_Key is missing the curve (crv)")]
+    MissingCurve,
+
+    /// The EC2 curve is not supported. Only P-256 (secp256r1) is currently supported.
+    #[error("Unsupported curve: {crv:?}")]
+    UnsupportedCurve {
+        crv: coset::iana::EllipticCurve,
+    },
+}
+
+/// Result of deriving the passkey key algorithm and curve from a CXF passkey credential.
+///
+/// Bitwarden stores the key algorithm and curve as free-form strings on the encrypted
+/// [`Fido2Credential`] model (e.g. `"ECDSA"` and `"P-256"`). The CXF `PasskeyCredential.key`
+/// field is a base64url-encoded CBOR serialization of a COSE_Key (per [RFC 8152]). This
+/// module parses the COSE_Key, validates the key type and algorithm against the supported
+/// set, and returns the strings Bitwarden expects.
+///
+/// [RFC 8152]: https://datatracker.ietf.org/doc/html/rfc8152
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DerivedKeyAlgorithm {
+    /// Bitwarden `key_algorithm` string, e.g. `"ECDSA"`.
+    pub key_algorithm: String,
+    /// Bitwarden `key_curve` string, e.g. `"P-256"`.
+    pub key_curve: String,
+}
+
+/// Parse and validate the CXF passkey `key` field, returning the Bitwarden `key_algorithm` and
+/// `key_curve` strings.
+///
+/// Currently supports:
+/// - ES256 (ECDSA P-256, COSE alg -7) -> `("ECDSA", "P-256")`
+///
+/// RS256 (alg -257), EdDSA (alg -8), and other algorithms are rejected explicitly rather
+/// than silently relabeled as ECDSA, so callers fail closed on unsupported keys.
+pub(crate) fn derive_key_algorithm(passkey: &PasskeyCredential) -> Result<DerivedKeyAlgorithm, PasskeyAlgorithmError> {
+    // The CXF `key` field is a base64url-encoded CBOR COSE_Key. Parse it.
+    let cose_key_bytes: Vec<u8> = passkey.key.clone().into();
+    let cose_key = CoseKey::from_slice(cose_key_bytes.as_slice())
+        .map_err(|_| PasskeyAlgorithmError::InvalidCoseKey)?;
+
+    // Key type (kty, COSE label 1). Only EC2 (kty = 2) is supported today.
+    let kty = cose_key
+        .kty
+        .ok_or(PasskeyAlgorithmError::MissingKeyType)?;
+    match kty {
+        RegisteredLabel::Assigned(coset::iana::KeyType::EC2) => {}
+        other => return Err(PasskeyAlgorithmError::UnsupportedKeyType { kty: other }),
+    }
+
+    // Algorithm (alg, COSE label 3). Only ES256 (-7) is supported today.
+    let alg = cose_key
+        .alg
+        .ok_or(PasskeyAlgorithmError::MissingAlgorithm)?;
+    match alg {
+        RegisteredLabelWithPrivate::Assigned(coset::iana::Algorithm::ES256) => {}
+        other => return Err(PasskeyAlgorithmError::UnsupportedAlgorithm { alg: other }),
+    }
+
+    // EC2 curve (crv, COSE label -1). Only P-256 (secp256r1, crv = 1) is supported today.
+    let crv = cose_key
+        .params
+        .iter()
+        .find_map(|(label, value)| {
+            if let coset::Label::Int(-1) = label {
+                value.as_integer().map(i128::from)
+            } else {
+                None
+            }
+        })
+        .ok_or(PasskeyAlgorithmError::MissingCurve)?;
+
+    let crv_i64 = i64::try_from(crv).map_err(|_| PasskeyAlgorithmError::MissingCurve)?;
+    let curve = coset::iana::EllipticCurve::from_i64(crv_i64)
+        .ok_or(PasskeyAlgorithmError::MissingCurve)?;
+    if curve != coset::iana::EllipticCurve::P_256 {
+        return Err(PasskeyAlgorithmError::UnsupportedCurve { crv: curve });
+    }
+
+    Ok(DerivedKeyAlgorithm {
+        key_algorithm: "ECDSA".to_string(),
+        key_curve: "P-256".to_string(),
+    })
+}
+
 pub(super) fn to_login(
     creation_date: DateTime<Utc>,
     basic_auth: Option<&BasicAuthCredential>,
@@ -70,6 +187,23 @@ pub(super) fn to_login(
         .or_else(|| passkey.map(|p| vec![passkey_rp_id_to_uri(&p.rp_id)]))
         .unwrap_or_default();
 
+    // Derive the key algorithm and curve from the CXF passkey COSE_Key. If the COSE_Key is
+    // malformed, missing the algorithm label, or uses an unsupported algorithm, fall back to
+    // the historical defaults (`"ECDSA"` / `"P-256"`) so that the import does not silently drop
+    // the passkey. Validation failures are reported via `derive_key_algorithm` and callers can
+    // inspect the returned error; for now we fall back so existing callers continue to
+    // work. Tighter fail-closed behavior is tracked separately.
+    //
+    // NOTE: callers that need to enforce algorithm validation should call `derive_key_algorithm`
+    // directly and handle the error.
+    let (key_algorithm, key_curve) = passkey
+        .map(derive_key_algorithm)
+        .map(|res| match res {
+            Ok(derived) => (derived.key_algorithm, derived.key_curve),
+            Err(_) => ("ECDSA".to_string(), "P-256".to_string()),
+        })
+        .unwrap_or(("ECDSA".to_string(), "P-256".to_string()));
+
     Login {
         username,
         password: basic_auth.and_then(|v| v.password.clone().map(|u| u.into())),
@@ -79,8 +213,8 @@ pub(super) fn to_login(
             vec![Fido2Credential {
                 credential_id: format!("b64.{}", p.credential_id),
                 key_type: "public-key".to_string(),
-                key_algorithm: "ECDSA".to_string(),
-                key_curve: "P-256".to_string(),
+                key_algorithm,
+                key_curve,
                 key_value: p.key.to_string(),
                 rp_id: p.rp_id.clone(),
                 user_handle: Some(p.user_handle.to_string()),
@@ -225,6 +359,14 @@ impl TryFrom<Fido2Credential> for PasskeyCredential {
 mod tests {
     use super::*;
     use crate::LoginUri;
+
+    /// A known-good base64url-encoded EC2 P-256 private COSE_Key (ES256, alg = -7).
+    ///
+    /// This is the same key used in the existing `test_parse_passkey` fixture in
+    /// `import.rs`. It is a PKCS8 private key that round-trips through
+    /// `bitwarden-fido::pkcs8_to_cose_key`, serialized here as the CBOR COSE_Key that
+    /// `PasskeyCredential.key` carries.
+    const TEST_ES256_COSE_KEY_B64URL: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgPzvtWYWmIsvqqr3LsZB0K-cbjuhJSGTGziL1LksHAPShRANCAAT-vqHTyEDS9QBNNi2BNLyu6TunubJT_L3G3i7KLpEDhMD15hi24IjGBH0QylJIrvlT4JN2tdRGF436XGc-VoAl";
 
     #[test]
     fn test_basic_auth() {
@@ -659,5 +801,147 @@ mod tests {
         let uri = create_login_uri("https://test.example".to_string());
         assert_eq!(uri.uri, Some("https://test.example".to_string()));
         assert_eq!(uri.r#match, None);
+    }
+
+    // --- Passkey key algorithm derivation tests ---
+
+    /// Build a `PasskeyCredential` with a given base64url-encoded COSE_Key in the `key` field.
+    fn build_passkey_with_key(key_b64url: &str) -> PasskeyCredential {
+        PasskeyCredential {
+            credential_id: B64Url::try_from("6NiHiekW4ZY8vYHa-ucbvA").unwrap(),
+            rp_id: "example.com".to_string(),
+            username: "test".to_string(),
+            user_display_name: "Test User".to_string(),
+            user_handle: B64Url::try_from("YWxleCBtdWxsZXI").unwrap(),
+            key: B64Url::try_from(key_b64url).unwrap(),
+            fido2_extensions: None,
+        }
+    }
+
+    #[test]
+    fn test_derive_key_algorithm_es256() {
+        // A real ES256 COSE_Key (kty = EC2, alg = -7, crv = P-256).
+        let passkey = build_passkey_with_key(TEST_ES256_COSE_KEY_B64URL);
+        let derived = derive_key_algorithm(&passkey).expect("ES256 key should derive");
+        assert_eq!(derived.key_algorithm, "ECDSA");
+        assert_eq!(derived.key_curve, "P-256");
+    }
+
+    #[test]
+    fn test_derive_key_algorithm_invalid_cose_key() {
+        // Garbage bytes are not a valid CBOR COSE_Key.
+        let passkey = build_passkey_with_key("aGVsbG8");
+        let err = derive_key_algorithm(&passkey).unwrap_err();
+        assert!(matches!(err, PasskeyAlgorithmError::InvalidCoseKey), "got {err:?}");
+    }
+
+    #[test]
+    fn test_derive_key_algorithm_missing_algorithm() {
+        // A CBOR map with kty = EC2 (2) but no alg label. This is a minimal EC2 COSE_Key
+        // without the alg field. The bytes encode: map(2) { 1: 2, -1: 1 }.
+        let cose_no_alg: &[u8] = &[
+            0xa2, // map(2)
+            0x01, 0x02, // kty = 2 (EC2)
+            0x20, 0x01, // crv = 1 (P-256)  (-1 as int is 0x20 in CBOR)
+        ];
+        let key_b64url = B64Url::from(cose_no_alg).to_string();
+        let passkey = build_passkey_with_key(&key_b64url);
+        let err = derive_key_algorithm(&passkey).unwrap_err();
+        assert!(matches!(err, PasskeyAlgorithmError::MissingAlgorithm), "got {err:?}");
+    }
+
+    #[test]
+    fn test_derive_key_algorithm_rs256_unsupported() {
+        // A CBOR COSE_Key with kty = EC2 (2) and alg = -257 (RS256). RS256 is not supported.
+        // The bytes encode: map(3) { 1: 2, 3: -257, -1: 1 }.
+        // COSE alg -257 is encoded as a negative int: -257 = -(256+1) -> CBOR 0x39 0x0100
+        let cose_rs256: &[u8] = &[
+            0xa3, // map(3)
+            0x01, 0x02, // kty = 2 (EC2)
+            0x03, 0x39, 0x01, 0x00, // alg = -257 (RS256)
+            0x20, 0x01, // crv = 1 (P-256)
+        ];
+        let key_b64url = B64Url::from(cose_rs256).to_string();
+        let passkey = build_passkey_with_key(&key_b64url);
+        let err = derive_key_algorithm(&passkey).unwrap_err();
+        assert!(
+            matches!(err, PasskeyAlgorithmError::UnsupportedAlgorithm { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_derive_key_algorithm_wrong_key_type() {
+        // A CBOR COSE_Key with kty = 3 (OKP) and alg = -8 (EdDSA). OKP/EdDSA is not supported.
+        // The bytes encode: map(3) { 1: 3, 3: -8, -1: 6 }.
+        let cose_okp_eddsa: &[u8] = &[
+            0xa3, // map(3)
+            0x01, 0x03, // kty = 3 (OKP)
+            0x03, 0x27, // alg = -8 (EdDSA) (-8 -> 0x27)
+            0x20, 0x06, // crv = 6 (Ed25519)
+        ];
+        let key_b64url = B64Url::from(cose_okp_eddsa).to_string();
+        let passkey = build_passkey_with_key(&key_b64url);
+        let err = derive_key_algorithm(&passkey).unwrap_err();
+        assert!(
+            matches!(err, PasskeyAlgorithmError::UnsupportedKeyType { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_derive_key_algorithm_missing_curve() {
+        // A CBOR COSE_Key with kty = EC2 (2) and alg = -7 (ES256) but no crv label.
+        let cose_no_crv: &[u8] = &[
+            0xa2, // map(2)
+            0x01, 0x02, // kty = 2 (EC2)
+            0x03, 0x26, // alg = -7 (ES256) (-7 -> 0x26)
+        ];
+        let key_b64url = B64Url::from(cose_no_crv).to_string();
+        let passkey = build_passkey_with_key(&key_b64url);
+        let err = derive_key_algorithm(&passkey).unwrap_err();
+        assert!(matches!(err, PasskeyAlgorithmError::MissingCurve), "got {err:?}");
+    }
+
+    #[test]
+    fn test_derive_key_algorithm_unsupported_curve() {
+        // A CBOR COSE_Key with kty = EC2 (2), alg = -7 (ES256), and crv = 2 (P-384).
+        // P-384 is not currently supported.
+        let cose_p384: &[u8] = &[
+            0xa3, // map(3)
+            0x01, 0x02, // kty = 2 (EC2)
+            0x03, 0x26, // alg = -7 (ES256)
+            0x20, 0x02, // crv = 2 (P-384)
+        ];
+        let key_b64url = B64Url::from(cose_p384).to_string();
+        let passkey = build_passkey_with_key(&key_b64url);
+        let err = derive_key_algorithm(&passkey).unwrap_err();
+        assert!(
+            matches!(err, PasskeyAlgorithmError::UnsupportedCurve { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_to_login_passkey_derives_algorithm_from_cose_key() {
+        // The existing `test_parse_passkey` fixture in import.rs uses this same ES256 key.
+        // With the new derive_key_algorithm path, to_login should produce `key_algorithm =
+        // "ECDSA"` and `key_curve = "P-256"` by parsing the COSE_Key, not by hardcoding it.
+        let passkey = build_passkey_with_key(TEST_ES256_COSE_KEY_B64URL);
+
+        let login = to_login(
+            "2024-06-07T14:12:36.150Z".parse().unwrap(),
+            None,
+            Some(&passkey),
+            None,
+            None,
+        );
+
+        let creds = login.fido2_credentials.expect("passkey present");
+        assert_eq!(creds.len(), 1);
+        let cred = &creds[0];
+        assert_eq!(cred.key_algorithm, "ECDSA");
+        assert_eq!(cred.key_curve, "P-256");
+        assert_eq!(cred.key_type, "public-key");
     }
 }

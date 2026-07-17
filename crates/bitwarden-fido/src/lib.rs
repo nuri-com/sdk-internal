@@ -145,6 +145,8 @@ pub enum FillCredentialError {
     InvalidInputLength(#[from] InvalidInputLengthError),
     #[error(transparent)]
     CoseKeyToPkcs8(#[from] CoseKeyToPkcs8Error),
+    #[error("{0}")]
+    UnsupportedAlgorithm(String),
 }
 
 #[allow(missing_docs)]
@@ -158,11 +160,14 @@ pub fn fill_with_credential(
         .map(|u| B64Url::from(u.to_vec()).to_string());
     let key_value = B64Url::from(cose_key_to_pkcs8(&value.key)?).to_string();
 
+    // Derive key algorithm and curve from the COSE key instead of hardcoding ECDSA/P-256.
+    let (key_algorithm, key_curve) = derive_algorithm_from_cose_key(&value.key)?;
+
     Ok(Fido2CredentialFullView {
         credential_id: guid_bytes_to_string(&cred_id)?,
         key_type: "public-key".to_owned(),
-        key_algorithm: "ECDSA".to_owned(),
-        key_curve: "P-256".to_owned(),
+        key_algorithm,
+        key_curve,
         key_value,
         rp_id: value.rp_id,
         rp_name: view.rp_name.clone(),
@@ -173,7 +178,42 @@ pub fn fill_with_credential(
         user_display_name: view.user_display_name.clone(),
         discoverable: "true".to_owned(),
         creation_date: chrono::offset::Utc::now(),
+        extension_state: None,
     })
+}
+
+/// Derive the key algorithm and curve name from a COSE key.
+///
+/// Returns `(algorithm_name, curve_name)` or an error for unsupported algorithms.
+/// This validates the imported signing-key algorithm instead of silently hardcoding ECDSA P-256.
+fn derive_algorithm_from_cose_key(
+    key: &coset::CoseKey,
+) -> Result<(String, String), FillCredentialError> {
+    use coset::Label;
+
+    // COSE algorithm identifiers from RFC 8152 and WebAuthn
+    const COSE_ALG_ES256: i64 = -7;
+    const COSE_ALG_RS256: i64 = -257;
+
+    // Check the algorithm label in the COSE key
+    let alg = key.alg.as_ref().and_then(|label| match label {
+        Label::Int(i) => Some(*i),
+        Label::Bytes(_) => None,
+    });
+
+    match alg {
+        Some(COSE_ALG_ES256) | None => {
+            // ES256 = ECDSA P-256 (secp256r1). Default to ES256 when algorithm is absent
+            // (matches WebAuthn default for discoverable credentials).
+            Ok(("ECDSA".to_string(), "P-256".to_string()))
+        }
+        Some(COSE_ALG_RS256) => Err(FillCredentialError::UnsupportedAlgorithm(format!(
+            "unsupported key algorithm: RS256 (-257), expected ES256 (-7)"
+        ))),
+        Some(other) => Err(FillCredentialError::UnsupportedAlgorithm(format!(
+            "unsupported key algorithm: {other}, expected ES256 (-7)"
+        ))),
+    }
 }
 
 pub(crate) fn try_from_credential_new_view(
@@ -210,11 +250,13 @@ pub(crate) fn try_from_credential_full(
     let key_value = B64Url::from(cose_key_to_pkcs8(&value.key)?).to_string();
     let user_handle = B64Url::from(user.id.to_vec()).to_string();
 
+    let (key_algorithm, key_curve) = derive_algorithm_from_cose_key(&value.key)?;
+
     Ok(Fido2CredentialFullView {
         credential_id: guid_bytes_to_string(&cred_id)?,
         key_type: "public-key".to_owned(),
-        key_algorithm: "ECDSA".to_owned(),
-        key_curve: "P-256".to_owned(),
+        key_algorithm,
+        key_curve,
         key_value,
         rp_id: value.rp_id,
         rp_name: rp.name,
@@ -225,6 +267,7 @@ pub(crate) fn try_from_credential_full(
         user_display_name: user.display_name,
         discoverable: options.rk.to_string(),
         creation_date: chrono::offset::Utc::now(),
+        extension_state: None,
     })
 }
 

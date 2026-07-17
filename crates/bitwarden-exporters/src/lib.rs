@@ -454,6 +454,7 @@ impl From<Fido2Credential> for Fido2CredentialFullView {
             user_display_name: value.user_display_name,
             discoverable: value.discoverable,
             creation_date: value.creation_date,
+            extension_state: None,
         }
     }
 }

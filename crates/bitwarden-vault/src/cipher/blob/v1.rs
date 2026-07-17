@@ -73,6 +73,9 @@ pub(crate) struct Fido2CredentialDataV1 {
     pub user_display_name: Option<String>,
     pub discoverable: bool,
     pub creation_date: DateTime<Utc>,
+    /// Optional encrypted FIDO2 extension state (opaque encrypted string).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension_state: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -273,6 +276,7 @@ mod tests {
                     user_display_name: Some("Test User".to_string()),
                     discoverable: true,
                     creation_date: Utc.with_ymd_and_hms(2024, 6, 1, 10, 30, 0).unwrap(),
+                    extension_state: None,
                 }],
             }),
             fields: vec![FieldDataV1 {

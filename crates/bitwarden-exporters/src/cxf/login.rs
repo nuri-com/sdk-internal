@@ -11,8 +11,8 @@ use coset::{
     CborSerializable, CoseKey, RegisteredLabel, RegisteredLabelWithPrivate, iana::EnumI64,
 };
 use credential_exchange_format::{
-    AndroidAppIdCredential, B64Url, BasicAuthCredential, CredentialScope, NotB64UrlEncoded,
-    OTPHashAlgorithm, PasskeyCredential, TotpCredential,
+    AndroidAppIdCredential, B64Url, BasicAuthCredential, CredentialScope, Fido2Extensions,
+    HmacCredentials, NotB64UrlEncoded, OTPHashAlgorithm, PasskeyCredential, TotpCredential,
 };
 use thiserror::Error;
 
@@ -165,6 +165,29 @@ pub(crate) fn derive_key_algorithm(passkey: &PasskeyCredential) -> Result<Derive
     })
 }
 
+/// Build the JSON-serialized extension state string from CXF FIDO2 extensions.
+///
+/// Returns `None` when the CXF passkey does not carry `fido2_extensions` or when the
+/// extensions do not include HMAC/PRF seed state. The returned string is a JSON
+/// serialization of `Fido2ExtensionStateView` (camelCase) and is stored as-is in the
+/// encrypted cipher's `extension_state` field.
+fn extensions_to_state_json(
+    extensions: Option<&Fido2Extensions>,
+    key_algorithm_metadata: &str,
+) -> Option<String> {
+    let ext = extensions?;
+    let hmac = ext.hmac_credentials.as_ref()?;
+    let state = serde_json::json!({
+        "prfHmacAlgorithm": hmac.algorithm,
+        "uvHmacSeed": hmac.cred_with_uv.to_string(),
+        "nonUvHmacSeed": hmac.cred_without_uv.as_ref().map(|v| v.to_string()),
+        "credBlob": None::<String>,
+        "largeBlob": None::<String>,
+        "keyAlgorithmMetadata": key_algorithm_metadata,
+    });
+    serde_json::to_string(&state).ok()
+}
+
 pub(super) fn to_login(
     creation_date: DateTime<Utc>,
     basic_auth: Option<&BasicAuthCredential>,
@@ -196,13 +219,25 @@ pub(super) fn to_login(
     //
     // NOTE: callers that need to enforce algorithm validation should call `derive_key_algorithm`
     // directly and handle the error.
-    let (key_algorithm, key_curve) = passkey
-        .map(derive_key_algorithm)
+    let derived = passkey.map(derive_key_algorithm);
+    let (key_algorithm, key_curve) = derived
+        .as_ref()
         .map(|res| match res {
-            Ok(derived) => (derived.key_algorithm, derived.key_curve),
+            Ok(d) => (d.key_algorithm.clone(), d.key_curve.clone()),
             Err(_) => ("ECDSA".to_string(), "P-256".to_string()),
         })
         .unwrap_or(("ECDSA".to_string(), "P-256".to_string()));
+
+    // Build the key algorithm metadata string from the derived algorithm (when available).
+    // This is stored in the extension state so that the imported key algorithm is validated
+    // rather than assumed.
+    let key_algorithm_metadata = derived
+        .as_ref()
+        .map(|res| match res {
+            Ok(_) => "ES256".to_string(),
+            Err(_) => "unknown".to_string(),
+        })
+        .unwrap_or("unknown".to_string());
 
     Login {
         username,
@@ -224,6 +259,10 @@ pub(super) fn to_login(
                 user_display_name: Some(p.user_display_name.clone()),
                 discoverable: "true".to_string(),
                 creation_date,
+                extension_state: extensions_to_state_json(
+                    p.fido2_extensions.as_ref(),
+                    &key_algorithm_metadata,
+                ),
             }]
         }),
     }
@@ -328,6 +367,37 @@ pub enum PasskeyError {
     InvalidBase64(NotB64UrlEncoded),
 }
 
+/// Build CXF `Fido2Extensions` from the JSON-serialized extension state string.
+///
+/// Returns `None` when `extension_state` is absent, empty, or does not contain
+/// HMAC/PRF seed state. This is the inverse of [`extensions_to_state_json`].
+fn state_json_to_extensions(extension_state: &Option<String>) -> Option<Fido2Extensions> {
+    let json_str = extension_state.as_ref()?;
+    let value: serde_json::Value = serde_json::from_str(json_str).ok()?;
+
+    let algorithm = value
+        .get("prfHmacAlgorithm")
+        .and_then(|v| v.as_str())?
+        .to_string();
+    let uv_seed = value
+        .get("uvHmacSeed")
+        .and_then(|v| v.as_str())
+        .map(String::from)?;
+    let non_uv_seed = value
+        .get("nonUvHmacSeed")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    Some(Fido2Extensions {
+        hmac_credentials: Some(HmacCredentials {
+            algorithm,
+            cred_with_uv: B64Url::try_from(uv_seed.as_str()).ok()?,
+            cred_without_uv: non_uv_seed
+                .and_then(|s| B64Url::try_from(s.as_str()).ok()),
+        }),
+    })
+}
+
 impl TryFrom<Fido2Credential> for PasskeyCredential {
     type Error = PasskeyError;
 
@@ -350,7 +420,7 @@ impl TryFrom<Fido2Credential> for PasskeyCredential {
                 .map_err(PasskeyError::InvalidBase64)?
                 .ok_or(PasskeyError::MissingField(MissingFieldError("user_handle")))?,
             key: B64Url::try_from(value.key_value.as_str()).map_err(PasskeyError::InvalidBase64)?,
-            fido2_extensions: None,
+            fido2_extensions: state_json_to_extensions(&value.extension_state),
         })
     }
 }
@@ -426,6 +496,7 @@ mod tests {
             user_display_name: None,
             discoverable: "true".to_string(),
             creation_date: "2024-06-07T14:12:36.150Z".parse().unwrap(),
+            extension_state: None,
         };
 
         let passkey: PasskeyCredential = credential.try_into().unwrap();
@@ -943,5 +1014,126 @@ mod tests {
         assert_eq!(cred.key_algorithm, "ECDSA");
         assert_eq!(cred.key_curve, "P-256");
         assert_eq!(cred.key_type, "public-key");
+    }
+
+    // --- FIDO2 extension state preservation tests ---
+
+    /// Build a `PasskeyCredential` with `fido2_extensions` containing HMAC/PRF seeds.
+    fn build_passkey_with_extensions(
+        key_b64url: &str,
+        uv_seed: &str,
+        non_uv_seed: Option<&str>,
+    ) -> PasskeyCredential {
+        PasskeyCredential {
+            credential_id: B64Url::try_from("6NiHiekW4ZY8vYHa-ucbvA").unwrap(),
+            rp_id: "nuri.com".to_string(),
+            username: "test@nuri.com".to_string(),
+            user_display_name: "Test User".to_string(),
+            user_handle: B64Url::try_from("YWxleCBtdWxsZXI").unwrap(),
+            key: B64Url::try_from(key_b64url).unwrap(),
+            fido2_extensions: Some(Fido2Extensions {
+                hmac_credentials: Some(HmacCredentials {
+                    algorithm: "hmac-secret".to_string(),
+                    cred_with_uv: B64Url::try_from(uv_seed).unwrap(),
+                    cred_without_uv: non_uv_seed
+                        .and_then(|s| B64Url::try_from(s).ok()),
+                }),
+            }),
+        }
+    }
+
+    #[test]
+    fn test_to_login_preserves_extension_state() {
+        let passkey = build_passkey_with_extensions(
+            TEST_ES256_COSE_KEY_B64URL,
+            "ERERERERERERERERERERERERERERERERERERERERERE",
+            Some("IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIi"),
+        );
+
+        let login = to_login(
+            "2024-06-07T14:12:36.150Z".parse().unwrap(),
+            None,
+            Some(&passkey),
+            None,
+            None,
+        );
+
+        let creds = login.fido2_credentials.expect("passkey present");
+        assert_eq!(creds.len(), 1);
+        let cred = &creds[0];
+
+        let state_json = cred.extension_state.as_ref().expect("extension_state present");
+        let state: serde_json::Value = serde_json::from_str(state_json).unwrap();
+
+        assert_eq!(state["prfHmacAlgorithm"], "hmac-secret");
+        assert_eq!(
+            state["uvHmacSeed"],
+            "ERERERERERERERERERERERERERERERERERERERERERE"
+        );
+        assert_eq!(
+            state["nonUvHmacSeed"],
+            "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIi"
+        );
+        assert_eq!(state["keyAlgorithmMetadata"], "ES256");
+    }
+
+    #[test]
+    fn test_to_login_without_extensions_has_no_extension_state() {
+        let passkey = build_passkey_with_key(TEST_ES256_COSE_KEY_B64URL);
+
+        let login = to_login(
+            "2024-06-07T14:12:36.150Z".parse().unwrap(),
+            None,
+            Some(&passkey),
+            None,
+            None,
+        );
+
+        let creds = login.fido2_credentials.expect("passkey present");
+        assert_eq!(creds.len(), 1);
+        let cred = &creds[0];
+        assert!(cred.extension_state.is_none(), "extension_state should be None when fido2_extensions is None");
+    }
+
+    #[test]
+    fn test_cxf_round_trip_preserves_extension_state() {
+        // Import: CXF PasskeyCredential -> Fido2Credential
+        let passkey = build_passkey_with_extensions(
+            TEST_ES256_COSE_KEY_B64URL,
+            "ERERERERERERERERERERERERERERERERERERERERERE",
+            Some("IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIi"),
+        );
+
+        let login = to_login(
+            "2024-06-07T14:12:36.150Z".parse().unwrap(),
+            None,
+            Some(&passkey),
+            None,
+            None,
+        );
+
+        let cred = login.fido2_credentials.unwrap().into_iter().next().unwrap();
+
+        // Export: Fido2Credential -> CXF PasskeyCredential
+        let exported: PasskeyCredential = cred.try_into().unwrap();
+
+        // Verify extension state round-tripped
+        let extensions = exported.fido2_extensions.expect("fido2_extensions present");
+        let hmac = extensions
+            .hmac_credentials
+            .as_ref()
+            .expect("hmac_credentials present");
+        assert_eq!(hmac.algorithm, "hmac-secret");
+        assert_eq!(
+            hmac.cred_with_uv.to_string(),
+            "ERERERERERERERERERERERERERERERERERERERERERE"
+        );
+        assert_eq!(
+            hmac.cred_without_uv
+                .as_ref()
+                .map(|v| v.to_string())
+                .unwrap(),
+            "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIi"
+        );
     }
 }

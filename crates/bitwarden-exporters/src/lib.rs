@@ -436,6 +436,7 @@ pub struct Fido2Credential {
     pub user_display_name: Option<String>,
     pub discoverable: String,
     pub creation_date: DateTime<Utc>,
+    pub extension_state: Option<String>,
 }
 
 impl From<Fido2Credential> for Fido2CredentialFullView {
@@ -454,7 +455,9 @@ impl From<Fido2Credential> for Fido2CredentialFullView {
             user_display_name: value.user_display_name,
             discoverable: value.discoverable,
             creation_date: value.creation_date,
-            extension_state: None,
+            extension_state: value
+                .extension_state
+                .and_then(|s| serde_json::from_str(&s).ok()),
         }
     }
 }

@@ -5,9 +5,10 @@ use bitwarden_crypto::KeyStoreContext;
 use bitwarden_encoding::{B64Url, NotB64UrlEncodedError};
 use bitwarden_vault::{
     CipherError, CipherView, Fido2CredentialFullView, Fido2CredentialNewView, Fido2CredentialView,
+    Fido2ExtensionStateView,
 };
 use crypto::{CoseKeyToPkcs8Error, PrivateKeyFromSecretKeyError};
-use passkey::types::{CredentialExtensions, Passkey, ctap2::Aaguid};
+use passkey::types::{CredentialExtensions, Passkey, StoredHmacSecret, ctap2::Aaguid};
 
 #[cfg(feature = "uniffi")]
 uniffi::setup_scaffolding!();
@@ -128,13 +129,25 @@ fn try_from_credential_full_view(value: Fido2CredentialFullView) -> Result<Passk
 
     let key = pkcs8_to_cose_key(key_value.as_bytes())?;
 
+    // Bridge stored HMAC/PRF extension state into passkey-rs CredentialExtensions.
+    // The Fido2ExtensionStateView carries the UV and non-UV HMAC seeds as base64 strings.
+    // passkey-rs StoredHmacSecret expects raw byte vectors.
+    let hmac_secret = value.extension_state.as_ref().and_then(|es| {
+        let uv_seed = B64Url::try_from(es.uv_hmac_seed.as_str()).ok()?;
+        let non_uv_seed = es.non_uv_hmac_seed.as_ref().and_then(|s| B64Url::try_from(s.as_str()).ok());
+        Some(StoredHmacSecret {
+            cred_with_uv: uv_seed.into_bytes().into(),
+            cred_without_uv: non_uv_seed.map(|s| s.into_bytes().into()),
+        })
+    });
+
     Ok(Passkey {
         key,
         credential_id: string_to_guid_bytes(&value.credential_id)?.into(),
         rp_id: value.rp_id.clone(),
         user_handle: user_handle.map(|u| u.into_bytes().into()),
         counter,
-        extensions: CredentialExtensions { hmac_secret: None },
+        extensions: CredentialExtensions { hmac_secret },
     })
 }
 
@@ -163,6 +176,21 @@ pub fn fill_with_credential(
     // Derive key algorithm and curve from the COSE key instead of hardcoding ECDSA/P-256.
     let (key_algorithm, key_curve) = derive_algorithm_from_cose_key(&value.key)?;
 
+    // Preserve HMAC/PRF extension state from the Passkey's CredentialExtensions.
+    let extension_state = value.extensions.hmac_secret.as_ref().map(|hmac| {
+        Fido2ExtensionStateView {
+            prf_hmac_algorithm: "hmac-secret".to_string(),
+            uv_hmac_seed: B64Url::from(hmac.cred_with_uv.to_vec()).to_string(),
+            non_uv_hmac_seed: hmac
+                .cred_without_uv
+                .as_ref()
+                .map(|s| B64Url::from(s.to_vec()).to_string()),
+            cred_blob: None,
+            large_blob: None,
+            key_algorithm_metadata: "ES256".to_string(),
+        }
+    });
+
     Ok(Fido2CredentialFullView {
         credential_id: guid_bytes_to_string(&cred_id)?,
         key_type: "public-key".to_owned(),
@@ -178,7 +206,7 @@ pub fn fill_with_credential(
         user_display_name: view.user_display_name.clone(),
         discoverable: "true".to_owned(),
         creation_date: chrono::offset::Utc::now(),
-        extension_state: None,
+        extension_state,
     })
 }
 
@@ -252,6 +280,22 @@ pub(crate) fn try_from_credential_full(
 
     let (key_algorithm, key_curve) = derive_algorithm_from_cose_key(&value.key)?;
 
+    // Preserve HMAC/PRF extension state from the Passkey's CredentialExtensions.
+    // This bridges passkey-rs StoredHmacSecret back to Fido2ExtensionStateView.
+    let extension_state = value.extensions.hmac_secret.as_ref().map(|hmac| {
+        Fido2ExtensionStateView {
+            prf_hmac_algorithm: "hmac-secret".to_string(),
+            uv_hmac_seed: B64Url::from(hmac.cred_with_uv.to_vec()).to_string(),
+            non_uv_hmac_seed: hmac
+                .cred_without_uv
+                .as_ref()
+                .map(|s| B64Url::from(s.to_vec()).to_string()),
+            cred_blob: None,
+            large_blob: None,
+            key_algorithm_metadata: "ES256".to_string(),
+        }
+    });
+
     Ok(Fido2CredentialFullView {
         credential_id: guid_bytes_to_string(&cred_id)?,
         key_type: "public-key".to_owned(),
@@ -267,7 +311,7 @@ pub(crate) fn try_from_credential_full(
         user_display_name: user.display_name,
         discoverable: options.rk.to_string(),
         creation_date: chrono::offset::Utc::now(),
-        extension_state: None,
+        extension_state,
     })
 }
 
@@ -363,6 +407,73 @@ mod tests {
             vec![
                 213, 72, 130, 110, 121, 180, 219, 64, 163, 216, 17, 17, 111, 126, 131, 73
             ]
+        );
+    }
+
+    #[test]
+    fn test_try_from_credential_full_view_bridges_hmac_state() {
+        use bitwarden_vault::Fido2ExtensionStateView;
+
+        let extension_state = Fido2ExtensionStateView {
+            prf_hmac_algorithm: "hmac-secret".to_string(),
+            uv_hmac_seed: "ERERERERERERERERERERERERERERERERERERERERERE".to_string(),
+            non_uv_hmac_seed: Some("IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIi".to_string()),
+            cred_blob: None,
+            large_blob: None,
+            key_algorithm_metadata: "ES256".to_string(),
+        };
+
+        let full_view = Fido2CredentialFullView {
+            credential_id: "b64.1UiCbnm020Cj2BERb36DSQ".to_string(),
+            key_type: "public-key".to_string(),
+            key_algorithm: "ECDSA".to_string(),
+            key_curve: "P-256".to_string(),
+            key_value: "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgPzvtWYWmIsvqqr3LsZB0K-cbjuhJSGTGziL1LksHAPShRANCAAT-vqHTyEDS9QBNNi2BNLyu6TunubJT_L3G3i7KLpEDhMD15hi24IjGBH0QylJIrvlT4JN2tdRGF436XGc-VoAl".to_string(),
+            rp_id: "nuri.com".to_string(),
+            user_handle: Some("YWxleCBtdWxsZXI".to_string()),
+            user_name: Some("test@nuri.com".to_string()),
+            counter: "0".to_string(),
+            rp_name: Some("Nuri".to_string()),
+            user_display_name: Some("Test User".to_string()),
+            discoverable: "true".to_string(),
+            creation_date: chrono::offset::Utc::now(),
+            extension_state: Some(extension_state),
+        };
+
+        let passkey = super::try_from_credential_full_view(full_view).unwrap();
+
+        let hmac = passkey
+            .extensions
+            .hmac_secret
+            .as_ref()
+            .expect("hmac_secret should be bridged from extension_state");
+        assert!(!hmac.cred_with_uv.is_empty());
+        assert!(hmac.cred_without_uv.is_some());
+    }
+
+    #[test]
+    fn test_try_from_credential_full_view_without_extension_state() {
+        let full_view = Fido2CredentialFullView {
+            credential_id: "b64.1UiCbnm020Cj2BERb36DSQ".to_string(),
+            key_type: "public-key".to_string(),
+            key_algorithm: "ECDSA".to_string(),
+            key_curve: "P-256".to_string(),
+            key_value: "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgPzvtWYWmIsvqqr3LsZB0K-cbjuhJSGTGziL1LksHAPShRANCAAT-vqHTyEDS9QBNNi2BNLyu6TunubJT_L3G3i7KLpEDhMD15hi24IjGBH0QylJIrvlT4JN2tdRGF436XGc-VoAl".to_string(),
+            rp_id: "nuri.com".to_string(),
+            user_handle: Some("YWxleCBtdWxsZXI".to_string()),
+            user_name: Some("test@nuri.com".to_string()),
+            counter: "0".to_string(),
+            rp_name: Some("Nuri".to_string()),
+            user_display_name: Some("Test User".to_string()),
+            discoverable: "true".to_string(),
+            creation_date: chrono::offset::Utc::now(),
+            extension_state: None,
+        };
+
+        let passkey = super::try_from_credential_full_view(full_view).unwrap();
+        assert!(
+            passkey.extensions.hmac_secret.is_none(),
+            "hmac_secret should be None when extension_state is None"
         );
     }
 }

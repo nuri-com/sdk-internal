@@ -240,7 +240,7 @@ impl<'a> Fido2Authenticator<'a> {
             .attested_credential_data
             .ok_or(MakeCredentialError::MissingAttestedCredentialData)?;
         let credential_id = attested_credential_data.credential_id().to_vec();
-        let extensions: GetAssertionExtensionsOutput = response.unsigned_extension_outputs.into();
+        let extensions: MakeCredentialExtensionsOutput = response.unsigned_extension_outputs.into();
 
         Ok(MakeCredentialResult {
             authenticator_data,
@@ -334,7 +334,7 @@ impl<'a> Fido2Authenticator<'a> {
         let selected_credential = self.get_selected_credential()?;
         let authenticator_data = response.auth_data.to_vec();
         let credential_id = string_to_guid_bytes(&selected_credential.credential.credential_id)?;
-        let extensions = response.unsigned_extension_outputs.into();
+        let extensions: GetAssertionExtensionsOutput = response.unsigned_extension_outputs.into();
 
         if prf_evaluation
             .as_ref()

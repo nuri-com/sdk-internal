@@ -11,7 +11,7 @@ use passkey::{
     },
     types::{
         Passkey,
-        ctap2::{self, Ctap2Code, Ctap2Error, StatusCode, VendorError},
+        ctap2::{self, Ctap2Error, StatusCode, VendorError},
     },
 };
 use thiserror::Error;
@@ -36,7 +36,7 @@ struct PrfEvaluationContext {
 impl PrfEvaluationContext {
     fn from_request(request: &GetAssertionRequest) -> Option<Self> {
         let prf = request.extensions.as_ref()?.prf.as_ref()?;
-        let credential_ids = prf
+        let credential_ids: Vec<Vec<u8>> = prf
             .eval_by_credential
             .as_ref()
             .map(|values| values.keys().cloned().collect())
@@ -240,7 +240,7 @@ impl<'a> Fido2Authenticator<'a> {
             .attested_credential_data
             .ok_or(MakeCredentialError::MissingAttestedCredentialData)?;
         let credential_id = attested_credential_data.credential_id().to_vec();
-        let extensions = response.unsigned_extension_outputs.into();
+        let extensions: GetAssertionExtensionsOutput = response.unsigned_extension_outputs.into();
 
         Ok(MakeCredentialResult {
             authenticator_data,

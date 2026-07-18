@@ -267,6 +267,7 @@ impl From<BitDeviceAuthKeyError> for DeviceAuthKeyCallbackError {
             BitDeviceAuthKeyError::InvalidPublicKeyCredentialDescriptor => {
                 Self::InvalidPublicKeyCredentialDescriptor
             }
+            BitDeviceAuthKeyError::InvalidPrfInput(_) => Self::Conversion,
             BitDeviceAuthKeyError::MasterPasswordHash => Self::MasterPasswordHash,
             BitDeviceAuthKeyError::MissingCredentialId => Self::MissingCredentialId,
             BitDeviceAuthKeyError::MissingHmacSecret => Self::MissingHmacSecret,

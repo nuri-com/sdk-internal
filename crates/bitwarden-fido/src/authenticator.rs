@@ -885,9 +885,7 @@ mod tests {
         Client, UserId,
         key_management::{KeySlotIds, SymmetricKeySlotId},
     };
-    use bitwarden_crypto::{
-        Decryptable, KeyStoreContext, PrimitiveEncryptable, SymmetricCryptoKey,
-    };
+    use bitwarden_crypto::{KeyStoreContext, PrimitiveEncryptable, SymmetricCryptoKey};
     use bitwarden_encoding::B64Url;
     use bitwarden_vault::{
         CipherListView, CipherRepromptType, CipherType, CipherView, EncryptionContext,
@@ -1198,13 +1196,13 @@ mod tests {
         assert_eq!(output.second, Some(expected_prf(&[0x11; 32], &second)));
     }
 
-    /// A credential-specific input for another credential does not require seed state.
+    /// A credential-specific input for another credential produces no PRF output.
     #[tokio::test]
     async fn test_prf_eval_by_credential_mismatch_produces_no_output() {
         let client = create_client();
         let cipher = {
             let mut ctx = client.internal.get_key_store().context();
-            create_test_cipher(&mut ctx)
+            create_test_cipher_with_extension(&mut ctx, Some(extension_state(Some(vec![0x22; 32]))))
         };
 
         let user_interface = MockUserInterface::verified();

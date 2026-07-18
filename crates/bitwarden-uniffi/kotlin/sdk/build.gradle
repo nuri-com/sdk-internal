@@ -43,10 +43,15 @@ android {
     }
 }
 
+String githubRepository() {
+    return System.getenv('GITHUB_REPOSITORY') ?: 'bitwarden/sdk-internal'
+}
+
 String composeDescription() {
     def commitHash = 'git rev-parse HEAD'.execute().text.trim()
     def changelog = 'git log -1 --oneline'.execute().text.trim()
     def workflowRunId = System.getenv('GITHUB_RUN_ID') ?: "local"
+    def sourceRepository = githubRepository()
 
     def workflowRunUrl
     switch (workflowRunId) {
@@ -54,7 +59,7 @@ String composeDescription() {
             workflowRunUrl = "local"
             break
         default:
-            workflowRunUrl = "https://github.com/bitwarden/sdk-internal/actions/runs/${workflowRunId}"
+            workflowRunUrl = "https://github.com/${sourceRepository}/actions/runs/${workflowRunId}"
             break
     }
 
@@ -119,7 +124,7 @@ publishing {
             pom {
                 name.set("Bitwarden SDK for Android")
                 description.set(aboutThisPackage)
-                url.set("https://github.com/bitwarden/sdk-internal")
+                url.set("https://github.com/${githubRepository()}")
             }
 
             afterEvaluate {
@@ -131,7 +136,7 @@ publishing {
     repositories {
         maven {
             name = 'GitHubPackages'
-            url = 'https://maven.pkg.github.com/bitwarden/sdk-internal'
+            url = "https://maven.pkg.github.com/${githubRepository()}"
             credentials {
                 username = System.getenv('GITHUB_ACTOR')
                 password = System.getenv('GITHUB_TOKEN')

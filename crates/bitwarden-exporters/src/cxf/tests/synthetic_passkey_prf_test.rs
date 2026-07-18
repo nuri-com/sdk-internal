@@ -3,6 +3,9 @@ mod tests {
     use std::sync::Mutex;
 
     use async_trait::async_trait;
+    use bitwarden_api_api::models::{
+        CipherDetailsResponseModel, CipherRequestModel, SyncResponseModel,
+    };
     use bitwarden_core::{Client, key_management::SymmetricKeySlotId};
     use bitwarden_crypto::SymmetricCryptoKey;
     use bitwarden_encoding::B64Url;
@@ -12,7 +15,7 @@ mod tests {
         GetAssertionPrfInput, GetAssertionRequest, Options, PrfInputValues, UiHint, Verification,
     };
     use bitwarden_vault::{
-        CipherListView, CipherView, EncryptionContext, Fido2CredentialFullView,
+        Cipher, CipherListView, CipherView, EncryptionContext, Fido2CredentialFullView,
         Fido2CredentialNewView,
     };
     use credential_exchange_format::{Credential, Header, PasskeyCredential};
@@ -219,6 +222,61 @@ mod tests {
             .to_string()
     }
 
+    fn request_extension_state(request: &CipherRequestModel) -> &str {
+        request
+            .login
+            .as_ref()
+            .and_then(|login| login.fido2_credentials.as_ref())
+            .and_then(|credentials| credentials.first())
+            .and_then(|credential| credential.extension_state.as_deref())
+            .expect("request extension state")
+    }
+
+    fn response_extension_state(response: &CipherDetailsResponseModel) -> &str {
+        response
+            .login
+            .as_ref()
+            .and_then(|login| login.fido2_credentials.as_ref())
+            .and_then(|credentials| credentials.first())
+            .and_then(|credential| credential.extension_state.as_deref())
+            .expect("response extension state")
+    }
+
+    fn cipher_extension_state(cipher: &Cipher) -> String {
+        cipher
+            .login
+            .as_ref()
+            .and_then(|login| login.fido2_credentials.as_ref())
+            .and_then(|credentials| credentials.first())
+            .and_then(|credential| credential.extension_state.as_ref())
+            .expect("SDK cipher extension state")
+            .to_string()
+    }
+
+    fn assert_no_plaintext_prf_material(wire_json: &str, passkey: &PasskeyCredential) {
+        let hmac = passkey
+            .fido2_extensions
+            .as_ref()
+            .and_then(|extensions| extensions.hmac_credentials.as_ref())
+            .expect("fixture hmac credentials");
+        let sensitive_values = [
+            hmac.cred_with_uv.to_string(),
+            hmac.cred_without_uv.to_string(),
+            passkey.key.to_string(),
+            EXPECTED_UV_FIRST.to_string(),
+            EXPECTED_UV_SECOND.to_string(),
+            "nuri-prf-salt-v1".to_string(),
+            "test-salt-2".to_string(),
+        ];
+
+        for sensitive_value in sensitive_values {
+            assert!(
+                !wire_json.contains(&sensitive_value),
+                "wire JSON must not contain plaintext seed, key, PRF input, or evaluated output"
+            );
+        }
+    }
+
     fn assert_imported_identity(
         credential: &Fido2CredentialFullView,
         fixture_passkey: &PasskeyCredential,
@@ -418,5 +476,110 @@ mod tests {
         assert_same_portable_credential(&before_reload, &after_reload);
 
         assert_literal_uv_prf_and_signature(&reload_client, reloaded_view).await;
+    }
+
+    #[tokio::test]
+    async fn synthetic_cxf_survives_sync_wire_and_native_assertion() {
+        let (header, fixture_passkey) = parse_fixture();
+        let account_payload = serde_json::to_string(&header.accounts[0]).unwrap();
+        let import_client = create_client();
+        let imported_cipher = import_client
+            .exporters()
+            .import_cxf(account_payload)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let mut rotated_view: CipherView = import_client
+            .internal
+            .get_key_store()
+            .decrypt(&imported_cipher)
+            .unwrap();
+        let before_wire = decrypt_fixture_credential(&import_client, &rotated_view);
+        assert_imported_identity(&before_wire, &fixture_passkey);
+
+        // Exercise the same wrapped cipher-key rotation path as the focused rotation test.
+        rotated_view
+            .generate_cipher_key(
+                &mut import_client.internal.get_key_store().context(),
+                SymmetricKeySlotId::User,
+            )
+            .unwrap();
+        rotated_view
+            .generate_cipher_key(
+                &mut import_client.internal.get_key_store().context(),
+                SymmetricKeySlotId::User,
+            )
+            .unwrap();
+        let encrypted_extension_state = encrypted_extension_state(&rotated_view);
+        let encrypted_cipher = import_client
+            .internal
+            .get_key_store()
+            .encrypt(rotated_view)
+            .unwrap();
+
+        // Upload boundary: SDK Cipher -> generated request model -> JSON -> generated model.
+        let request_model = CipherRequestModel::try_from(encrypted_cipher).unwrap();
+        let request_wire_json = serde_json::to_string(&request_model).unwrap();
+        assert_no_plaintext_prf_material(&request_wire_json, &fixture_passkey);
+        let request_from_wire: CipherRequestModel =
+            serde_json::from_str(&request_wire_json).unwrap();
+        assert_eq!(
+            request_extension_state(&request_from_wire),
+            encrypted_extension_state
+        );
+
+        // The server treats encrypted cipher fields as opaque. Add only response metadata, then
+        // cross the generated CipherDetailsResponseModel and SyncResponseModel JSON boundary.
+        let revision_date = request_from_wire
+            .last_known_revision_date
+            .clone()
+            .expect("request revision date");
+        let mut response_json = serde_json::to_value(&request_from_wire).unwrap();
+        let response_object = response_json.as_object_mut().unwrap();
+        response_object.insert(
+            "creationDate".to_string(),
+            serde_json::Value::String(revision_date.clone()),
+        );
+        response_object.insert(
+            "revisionDate".to_string(),
+            serde_json::Value::String(revision_date),
+        );
+        let response_model: CipherDetailsResponseModel =
+            serde_json::from_value(response_json).unwrap();
+        assert_eq!(
+            response_extension_state(&response_model),
+            encrypted_extension_state
+        );
+        let sync_model = SyncResponseModel {
+            ciphers: Some(vec![response_model]),
+            ..SyncResponseModel::default()
+        };
+        let sync_wire_json = serde_json::to_string(&sync_model).unwrap();
+        assert_no_plaintext_prf_material(&sync_wire_json, &fixture_passkey);
+
+        // Download boundary: JSON -> generated sync models -> SDK Cipher -> fresh-client decrypt.
+        let sync_from_wire: SyncResponseModel = serde_json::from_str(&sync_wire_json).unwrap();
+        let response_from_wire = sync_from_wire.ciphers.unwrap().into_iter().next().unwrap();
+        assert_eq!(
+            response_extension_state(&response_from_wire),
+            encrypted_extension_state
+        );
+        let synced_cipher = Cipher::try_from(response_from_wire).unwrap();
+        assert_eq!(
+            cipher_extension_state(&synced_cipher),
+            encrypted_extension_state
+        );
+
+        let fresh_client = create_client();
+        let reloaded_view: CipherView = fresh_client
+            .internal
+            .get_key_store()
+            .decrypt(&synced_cipher)
+            .unwrap();
+        let after_wire = decrypt_fixture_credential(&fresh_client, &reloaded_view);
+        assert_imported_identity(&after_wire, &fixture_passkey);
+        assert_same_portable_credential(&before_wire, &after_wire);
+        assert_literal_uv_prf_and_signature(&fresh_client, reloaded_view).await;
     }
 }

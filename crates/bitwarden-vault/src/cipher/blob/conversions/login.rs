@@ -435,10 +435,8 @@ mod tests {
     #[test]
     fn test_fido2_extension_state_with_only_uv_seed() {
         // Tests that extension state with only a UV seed (no non-UV seed) round-trips correctly
-        let extension_state = Fido2ExtensionStateView {
-            non_uv_hmac_seed: None,
-            ..test_extension_state()
-        };
+        let mut extension_state = test_extension_state();
+        extension_state.non_uv_hmac_seed = None;
 
         let full_view = Fido2CredentialFullView {
             credential_id: "cred-id".to_string(),

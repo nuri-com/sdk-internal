@@ -18,7 +18,7 @@ use subtle::ConstantTimeEq;
 use tsify::Tsify;
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::wasm_bindgen;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use super::cipher::{CipherKind, StrictDecrypt};
 use crate::{Cipher, PasswordHistoryView, VaultParseError, cipher::cipher::CopyableCipherFields};
@@ -91,7 +91,7 @@ impl LoginUriView {
 ///
 /// Serialized as JSON and encrypted as a single opaque `EncString` in [`Fido2Credential`].
 /// The server never sees the individual fields — it stores one encrypted string.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Zeroize)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Zeroize, ZeroizeOnDrop)]
 #[serde(rename_all = "camelCase")]
 // Intentionally not a UniFFI record: mobile bindings only need the encrypted
 // `Fido2Credential::extension_state`, never the decoded HMAC seeds.
@@ -927,6 +927,31 @@ mod tests {
         Login,
         cipher::cipher::{CipherKind, CopyableCipherFields},
     };
+
+    #[test]
+    fn fido2_extension_state_zeroizes_and_zeroizes_on_drop() {
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+
+        assert_zeroize_on_drop::<super::Fido2ExtensionStateView>();
+
+        let mut state = super::Fido2ExtensionStateView {
+            prf_hmac_algorithm: "hmac-secret".to_string(),
+            uv_hmac_seed: "uv-seed".to_string(),
+            non_uv_hmac_seed: Some("non-uv-seed".to_string()),
+            cred_blob: Some("credential-blob".to_string()),
+            large_blob: Some("large-blob".to_string()),
+            key_algorithm_metadata: "ES256".to_string(),
+        };
+
+        zeroize::Zeroize::zeroize(&mut state);
+
+        assert!(state.prf_hmac_algorithm.is_empty());
+        assert!(state.uv_hmac_seed.is_empty());
+        assert!(state.non_uv_hmac_seed.is_none());
+        assert!(state.cred_blob.is_none());
+        assert!(state.large_blob.is_none());
+        assert!(state.key_algorithm_metadata.is_empty());
+    }
 
     #[test]
     fn test_valid_checksum() {

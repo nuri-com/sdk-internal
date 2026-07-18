@@ -735,9 +735,11 @@ impl passkey::authenticator::CredentialStore for CredentialStoreImpl<'_> {
             }
 
             let key_store = this.authenticator.client.internal.get_key_store();
-            let existing_credentials = selected
-                .cipher
-                .get_fido2_credentials(&mut key_store.context())?;
+            let existing_credentials = Zeroizing::new(
+                selected
+                    .cipher
+                    .get_fido2_credentials(&mut key_store.context())?,
+            );
             let existing_extension_state = existing_credentials
                 .iter()
                 .find(|credential| credential.credential_id == selected.credential.credential_id)

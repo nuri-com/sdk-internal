@@ -20,4 +20,10 @@ npx openapi-generator-cli generate \
     -t ./support/openapi-template \
     --additional-properties=library=reqwest-trait,mockall,topLevelApiClient,supportMiddleware=true,packageVersion=$VERSION,packageDescription=\"API bindings for the Bitwarden API.\"
 
+# The Nuri fork persists portable passkey extension state before the field exists in upstream
+# bitwarden/server. Scheduled upstream regeneration must fail rather than silently erase it.
+./support/verify-portable-passkey-bindings.sh \
+    api \
+    crates/bitwarden-api-api/src/models/cipher_fido2_credential_model.rs
+
 npm run prettier

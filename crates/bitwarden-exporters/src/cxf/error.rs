@@ -10,8 +10,14 @@ pub enum CxfError {
     Serde(#[from] serde_json::Error),
 
     #[error("Passkey import error: {0}")]
-    Passkey(#[from] PasskeyImportError),
+    Passkey(String),
 
     #[error("Internal error: {0}")]
     Internal(Cow<'static, str>),
+}
+
+impl From<PasskeyImportError> for CxfError {
+    fn from(error: PasskeyImportError) -> Self {
+        Self::Passkey(error.to_string())
+    }
 }

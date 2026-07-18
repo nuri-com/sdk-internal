@@ -99,7 +99,7 @@ mod tests {
             scope: None,
         };
 
-        let ciphers: Vec<ImportingCipher> = parse_item(item);
+        let ciphers: Vec<ImportingCipher> = parse_item(item).unwrap();
         assert_eq!(ciphers.len(), 1);
         let cipher = ciphers.first().unwrap();
 

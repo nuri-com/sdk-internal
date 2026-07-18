@@ -31,7 +31,10 @@ use crate::{
 pub(crate) fn parse_cxf(payload: String) -> Result<Vec<ImportingCipher>, CxfError> {
     let account: CxfAccount = serde_json::from_str(&payload)?;
 
-    let items: Vec<ImportingCipher> = account.items.into_iter().flat_map(parse_item).collect();
+    let mut items = Vec::new();
+    for item in account.items {
+        items.extend(parse_item(item)?);
+    }
 
     Ok(items)
 }
@@ -74,7 +77,7 @@ fn custom_fields_to_fields(custom_fields: &CustomFieldsCredential) -> Vec<Field>
         .collect()
 }
 
-pub(super) fn parse_item(value: Item) -> Vec<ImportingCipher> {
+pub(super) fn parse_item(value: Item) -> Result<Vec<ImportingCipher>, CxfError> {
     let grouped = group_credentials_by_type(value.credentials);
 
     let creation_date = convert_date(value.creation_at);
@@ -113,7 +116,7 @@ pub(super) fn parse_item(value: Item) -> Vec<ImportingCipher> {
         let passkey = grouped.passkey.first();
         let totp = grouped.totp.first();
 
-        let login = to_login(creation_date, basic_auth, passkey, totp, scope);
+        let login = to_login(creation_date, basic_auth, passkey, totp, scope)?;
         add_item(CipherType::Login(Box::new(login)), vec![], None);
     }
 
@@ -239,7 +242,7 @@ pub(super) fn parse_item(value: Item) -> Vec<ImportingCipher> {
         });
     }
 
-    output
+    Ok(output)
 }
 
 /// Group credentials by type.
@@ -350,7 +353,7 @@ mod tests {
             scope: None,
         };
 
-        let ciphers: Vec<ImportingCipher> = parse_item(item);
+        let ciphers: Vec<ImportingCipher> = parse_item(item).unwrap();
         assert_eq!(ciphers.len(), 0);
     }
 
@@ -380,7 +383,7 @@ mod tests {
             scope: None,
         };
 
-        let ciphers: Vec<ImportingCipher> = parse_item(item);
+        let ciphers: Vec<ImportingCipher> = parse_item(item).unwrap();
         assert_eq!(ciphers.len(), 1);
         let cipher = ciphers.first().unwrap();
 
@@ -464,7 +467,7 @@ mod tests {
             }),
         };
 
-        let ciphers: Vec<ImportingCipher> = parse_item(item);
+        let ciphers: Vec<ImportingCipher> = parse_item(item).unwrap();
         assert_eq!(ciphers.len(), 1);
         let cipher = ciphers.first().unwrap();
 
@@ -514,7 +517,7 @@ mod tests {
             scope: None,
         };
 
-        let ciphers: Vec<ImportingCipher> = parse_item(item);
+        let ciphers: Vec<ImportingCipher> = parse_item(item).unwrap();
         assert_eq!(ciphers.len(), 1);
         let cipher = ciphers.first().unwrap();
 
@@ -564,7 +567,7 @@ mod tests {
             scope: None,
         };
 
-        let ciphers: Vec<ImportingCipher> = parse_item(item);
+        let ciphers: Vec<ImportingCipher> = parse_item(item).unwrap();
         assert_eq!(ciphers.len(), 1);
         let cipher = ciphers.first().unwrap();
 
@@ -608,7 +611,7 @@ mod tests {
             scope: None,
         };
 
-        let ciphers: Vec<ImportingCipher> = parse_item(item);
+        let ciphers: Vec<ImportingCipher> = parse_item(item).unwrap();
         assert_eq!(ciphers.len(), 1);
         let cipher = ciphers.first().unwrap();
 
@@ -675,7 +678,7 @@ mod tests {
             scope: None,
         };
 
-        let ciphers: Vec<ImportingCipher> = parse_item(item);
+        let ciphers: Vec<ImportingCipher> = parse_item(item).unwrap();
         assert_eq!(ciphers.len(), 1);
         let cipher = ciphers.first().unwrap();
 
@@ -723,7 +726,7 @@ mod tests {
             scope: None,
         };
 
-        let ciphers: Vec<ImportingCipher> = parse_item(item);
+        let ciphers: Vec<ImportingCipher> = parse_item(item).unwrap();
         assert_eq!(ciphers.len(), 1); // Should create only one cipher (Login with note content)
         let cipher = ciphers.first().unwrap();
 
@@ -770,7 +773,7 @@ mod tests {
             scope: None,
         };
 
-        let ciphers: Vec<ImportingCipher> = parse_item(item);
+        let ciphers: Vec<ImportingCipher> = parse_item(item).unwrap();
         assert_eq!(ciphers.len(), 1); // Should create only one cipher (SecureNote with note content)
         let cipher = ciphers.first().unwrap();
 
@@ -828,7 +831,7 @@ mod tests {
             scope: None,
         };
 
-        let ciphers: Vec<ImportingCipher> = parse_item(item);
+        let ciphers: Vec<ImportingCipher> = parse_item(item).unwrap();
         assert_eq!(ciphers.len(), 1); // Should create only one cipher (Card with note content)
         let cipher = ciphers.first().unwrap();
 
@@ -877,7 +880,7 @@ mod tests {
             scope: None,
         };
 
-        let ciphers: Vec<ImportingCipher> = parse_item(item);
+        let ciphers: Vec<ImportingCipher> = parse_item(item).unwrap();
         assert_eq!(ciphers.len(), 1); // Should create only one cipher (SecureNote with note content)
         let cipher = ciphers.first().unwrap();
 
@@ -925,7 +928,7 @@ mod tests {
             scope: None,
         };
 
-        let ciphers: Vec<ImportingCipher> = parse_item(item);
+        let ciphers: Vec<ImportingCipher> = parse_item(item).unwrap();
         assert_eq!(ciphers.len(), 1);
         let cipher = ciphers.first().unwrap();
 
@@ -963,7 +966,7 @@ mod tests {
             scope: None,
         };
 
-        let ciphers: Vec<ImportingCipher> = parse_item(item);
+        let ciphers: Vec<ImportingCipher> = parse_item(item).unwrap();
         assert_eq!(ciphers.len(), 1);
         let cipher = ciphers.first().unwrap();
 
@@ -994,7 +997,7 @@ mod tests {
             scope: None,
         };
 
-        let ciphers: Vec<ImportingCipher> = parse_item(item);
+        let ciphers: Vec<ImportingCipher> = parse_item(item).unwrap();
         assert_eq!(ciphers.len(), 1);
         let cipher = ciphers.first().unwrap();
 
@@ -1025,7 +1028,7 @@ mod tests {
             scope: None,
         };
 
-        let ciphers: Vec<ImportingCipher> = parse_item(item);
+        let ciphers: Vec<ImportingCipher> = parse_item(item).unwrap();
         assert_eq!(ciphers.len(), 1);
         let cipher = ciphers.first().unwrap();
 
@@ -1064,7 +1067,7 @@ mod tests {
             scope: None,
         };
 
-        let ciphers: Vec<ImportingCipher> = parse_item(item);
+        let ciphers: Vec<ImportingCipher> = parse_item(item).unwrap();
         assert_eq!(ciphers.len(), 1); // Should create only one cipher (Identity with note content)
         let cipher = ciphers.first().unwrap();
 
@@ -1129,7 +1132,7 @@ mod tests {
             scope: None,
         };
 
-        let ciphers: Vec<ImportingCipher> = parse_item(item);
+        let ciphers: Vec<ImportingCipher> = parse_item(item).unwrap();
         assert_eq!(ciphers.len(), 1); // Should create only ONE secure note, not two
 
         let cipher = ciphers.first().unwrap();

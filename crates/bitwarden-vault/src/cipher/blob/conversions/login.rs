@@ -25,10 +25,6 @@ impl From<&LoginUriDataV1> for LoginUriView {
 
 impl From<&Fido2CredentialFullView> for Fido2CredentialDataV1 {
     fn from(view: &Fido2CredentialFullView) -> Self {
-        let extension_state = view
-            .extension_state
-            .as_ref()
-            .map(|es| serde_json::to_string(es).unwrap_or_default());
         Self {
             credential_id: view.credential_id.clone(),
             key_type: view.key_type.clone(),
@@ -43,17 +39,13 @@ impl From<&Fido2CredentialFullView> for Fido2CredentialDataV1 {
             user_display_name: view.user_display_name.clone(),
             discoverable: view.discoverable == "true",
             creation_date: view.creation_date,
-            extension_state,
+            extension_state: view.extension_state.clone(),
         }
     }
 }
 
 impl From<&Fido2CredentialDataV1> for Fido2CredentialFullView {
     fn from(data: &Fido2CredentialDataV1) -> Self {
-        let extension_state = data
-            .extension_state
-            .as_ref()
-            .and_then(|s| serde_json::from_str(s).ok());
         Self {
             credential_id: data.credential_id.clone(),
             key_type: data.key_type.clone(),
@@ -68,7 +60,7 @@ impl From<&Fido2CredentialDataV1> for Fido2CredentialFullView {
             user_display_name: data.user_display_name.clone(),
             discoverable: data.discoverable.to_string(),
             creation_date: data.creation_date,
-            extension_state,
+            extension_state: data.extension_state.clone(),
         }
     }
 }
@@ -76,6 +68,7 @@ impl From<&Fido2CredentialDataV1> for Fido2CredentialFullView {
 #[cfg(test)]
 mod tests {
     use bitwarden_crypto::{CompositeEncryptable, Decryptable};
+    use bitwarden_encoding::B64Url;
     use chrono::{TimeZone, Utc};
 
     use super::super::{CipherBlobV1, CipherTypeDataV1, LoginUriDataV1, test_support::*};
@@ -83,8 +76,22 @@ mod tests {
         cipher::CipherType,
         field::{FieldType, FieldView},
         linked_id::{LinkedIdType, LoginLinkedIdType},
-        login::{Fido2Credential, Fido2CredentialFullView, LoginUriView, LoginView, UriMatchType},
+        login::{
+            Fido2Credential, Fido2CredentialFullView, Fido2ExtensionStateView, LoginUriView,
+            LoginView, UriMatchType,
+        },
     };
+
+    fn test_extension_state() -> Fido2ExtensionStateView {
+        Fido2ExtensionStateView {
+            prf_hmac_algorithm: "hmac-secret".to_string(),
+            uv_hmac_seed: B64Url::from(vec![0x11; 32]).to_string(),
+            non_uv_hmac_seed: Some(B64Url::from(vec![0x22; 32]).to_string()),
+            cred_blob: Some(B64Url::from(b"credential-blob".as_slice()).to_string()),
+            large_blob: Some(r#"{"uncompressedSize":4,"data":"YmxvYg"}"#.to_string()),
+            key_algorithm_metadata: "ES256".to_string(),
+        }
+    }
 
     #[test]
     fn test_login_uri_view_to_data_drops_checksum() {
@@ -199,6 +206,7 @@ mod tests {
         let mut ctx = key_store.context_mut();
 
         // Create fido2 credentials by encrypting a FullView
+        let expected_extension_state = test_extension_state();
         let fido2_full = Fido2CredentialFullView {
             credential_id: "cred-123".to_string(),
             key_type: "public-key".to_string(),
@@ -213,7 +221,7 @@ mod tests {
             user_display_name: Some("Test User".to_string()),
             discoverable: "true".to_string(),
             creation_date: Utc.with_ymd_and_hms(2024, 6, 1, 10, 30, 0).unwrap(),
-            extension_state: None,
+            extension_state: Some(expected_extension_state.clone()),
         };
         let encrypted_fido2: Fido2Credential =
             fido2_full.encrypt_composite(&mut ctx, key_id).unwrap();
@@ -261,6 +269,10 @@ mod tests {
             assert_eq!(login_data.fido2_credentials.len(), 1);
             assert_eq!(login_data.fido2_credentials[0].counter, 42);
             assert!(login_data.fido2_credentials[0].discoverable);
+            assert_eq!(
+                login_data.fido2_credentials[0].extension_state.as_ref(),
+                Some(&expected_extension_state)
+            );
             // URI checksum should be dropped
             assert_eq!(login_data.uris.len(), 1);
         } else {
@@ -301,6 +313,10 @@ mod tests {
         assert_eq!(decrypted.counter, "42");
         assert_eq!(decrypted.discoverable, "true");
         assert_eq!(decrypted.rp_id, "example.com");
+        assert_eq!(
+            decrypted.extension_state.as_ref(),
+            Some(&expected_extension_state)
+        );
 
         // Fields and password history
         assert_eq!(restored.fields.as_ref().unwrap().len(), 1);
@@ -316,14 +332,7 @@ mod tests {
 
     #[test]
     fn test_fido2_extension_state_round_trip_through_blob() {
-        let extension_state = crate::cipher::login::Fido2ExtensionStateView {
-            prf_hmac_algorithm: "hmac-secret".to_string(),
-            uv_hmac_seed: "ERERERERERERERERERERERERERERERERERERERERERE".to_string(),
-            non_uv_hmac_seed: Some("IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIi".to_string()),
-            cred_blob: None,
-            large_blob: None,
-            key_algorithm_metadata: "ES256".to_string(),
-        };
+        let extension_state = test_extension_state();
 
         let full_view = Fido2CredentialFullView {
             credential_id: "cred-id".to_string(),
@@ -348,18 +357,12 @@ mod tests {
 
         assert_eq!(round_tripped.credential_id, "cred-id");
         assert_eq!(round_tripped.rp_id, "nuri.com");
-        assert_eq!(round_tripped.user_handle.as_deref(), Some("ICEiIyQlJicoKSorLC0uLw"));
-
-        let rt_state = round_tripped.extension_state.expect("extension_state should survive round trip");
-        assert_eq!(rt_state.prf_hmac_algorithm, "hmac-secret");
-        assert_eq!(rt_state.uv_hmac_seed, "ERERERERERERERERERERERERERERERERERERERERERE");
         assert_eq!(
-            rt_state.non_uv_hmac_seed.as_deref(),
-            Some("IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIi")
+            round_tripped.user_handle.as_deref(),
+            Some("ICEiIyQlJicoKSorLC0uLw")
         );
-        assert_eq!(rt_state.key_algorithm_metadata, "ES256");
-        assert!(rt_state.cred_blob.is_none());
-        assert!(rt_state.large_blob.is_none());
+
+        assert_eq!(round_tripped.extension_state, Some(extension_state));
     }
 
     #[test]
@@ -382,22 +385,24 @@ mod tests {
         };
 
         let data = super::Fido2CredentialDataV1::from(&full_view);
-        assert!(data.extension_state.is_none(), "extension_state should be None in V1 data");
+        assert!(
+            data.extension_state.is_none(),
+            "extension_state should be None in V1 data"
+        );
 
         let round_tripped = Fido2CredentialFullView::from(&data);
-        assert!(round_tripped.extension_state.is_none(), "extension_state should remain None after round trip");
+        assert!(
+            round_tripped.extension_state.is_none(),
+            "extension_state should remain None after round trip"
+        );
     }
 
     #[test]
     fn test_fido2_extension_state_with_only_uv_seed() {
         // Tests that extension state with only a UV seed (no non-UV seed) round-trips correctly
-        let extension_state = crate::cipher::login::Fido2ExtensionStateView {
-            prf_hmac_algorithm: "hmac-secret".to_string(),
-            uv_hmac_seed: "ERERERERERERERERERERERERERERERERERERERERERE".to_string(),
+        let extension_state = Fido2ExtensionStateView {
             non_uv_hmac_seed: None,
-            cred_blob: None,
-            large_blob: None,
-            key_algorithm_metadata: "ES256".to_string(),
+            ..test_extension_state()
         };
 
         let full_view = Fido2CredentialFullView {
@@ -422,7 +427,32 @@ mod tests {
 
         let rt_state = round_tripped.extension_state.unwrap();
         assert_eq!(rt_state.prf_hmac_algorithm, "hmac-secret");
-        assert_eq!(rt_state.uv_hmac_seed, "ERERERERERERERERERERERERERERERERERERERERERE");
+        assert_eq!(
+            rt_state.uv_hmac_seed,
+            B64Url::from(vec![0x11; 32]).to_string()
+        );
         assert!(rt_state.non_uv_hmac_seed.is_none());
+    }
+
+    #[test]
+    fn test_malformed_extension_state_fails_blob_deserialization() {
+        let value = serde_json::json!({
+            "credentialId": "cred-id",
+            "keyType": "public-key",
+            "keyAlgorithm": "ECDSA",
+            "keyCurve": "P-256",
+            "keyValue": "key-value",
+            "rpId": "example.com",
+            "userHandle": null,
+            "userName": null,
+            "counter": 0,
+            "rpName": null,
+            "userDisplayName": null,
+            "discoverable": true,
+            "creationDate": "2024-01-01T00:00:00Z",
+            "extensionState": { "uvHmacSeed": 42 }
+        });
+
+        assert!(serde_json::from_value::<super::Fido2CredentialDataV1>(value).is_err());
     }
 }

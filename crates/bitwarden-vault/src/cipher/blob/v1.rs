@@ -2,7 +2,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::cipher::{
-    field::FieldType, linked_id::LinkedIdType, login::UriMatchType, secure_note::SecureNoteType,
+    field::FieldType,
+    linked_id::LinkedIdType,
+    login::{Fido2ExtensionStateView, UriMatchType},
+    secure_note::SecureNoteType,
 };
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -73,9 +76,9 @@ pub(crate) struct Fido2CredentialDataV1 {
     pub user_display_name: Option<String>,
     pub discoverable: bool,
     pub creation_date: DateTime<Utc>,
-    /// Optional encrypted FIDO2 extension state (opaque encrypted string).
+    /// Optional FIDO2 extension state inside the encrypted cipher blob.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub extension_state: Option<String>,
+    pub extension_state: Option<Fido2ExtensionStateView>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]

@@ -93,11 +93,17 @@ impl LoginUriView {
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 #[cfg_attr(feature = "wasm", derive(Tsify), tsify(into_wasm_abi, from_wasm_abi))]
 pub struct Fido2ExtensionStateView {
+    /// Identifier for the FIDO hmac-secret/PRF algorithm.
     pub prf_hmac_algorithm: String,
+    /// Base64url-encoded 32-byte HMAC seed used after user verification.
     pub uv_hmac_seed: String,
+    /// Optional base64url-encoded 32-byte HMAC seed used without user verification.
     pub non_uv_hmac_seed: Option<String>,
+    /// Optional base64url-encoded credential blob.
     pub cred_blob: Option<String>,
+    /// Optional serialized WebAuthn large-blob state.
     pub large_blob: Option<String>,
+    /// Private-key algorithm metadata retained with the extension state.
     pub key_algorithm_metadata: String,
 }
 

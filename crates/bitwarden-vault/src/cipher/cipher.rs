@@ -23,6 +23,7 @@ use thiserror::Error;
 use tsify::Tsify;
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::wasm_bindgen;
+use zeroize::Zeroizing;
 
 use super::{
     attachment, bank_account,
@@ -1023,6 +1024,7 @@ impl CipherView {
         ctx: &mut KeyStoreContext<KeySlotIds>,
         creds: Vec<Fido2CredentialFullView>,
     ) -> Result<(), CipherError> {
+        let creds = Zeroizing::new(creds);
         let key = self.key_identifier();
 
         let ciphers_key = Cipher::decrypt_cipher_key(ctx, key, &self.key)?;
@@ -1053,7 +1055,7 @@ impl CipherView {
         &self,
         ctx: &mut KeyStoreContext<KeySlotIds>,
     ) -> Result<String, CipherError> {
-        let fido2_credential = self.get_fido2_credentials(ctx)?;
+        let fido2_credential = Zeroizing::new(self.get_fido2_credentials(ctx)?);
 
         Ok(fido2_credential[0].key_value.clone())
     }
@@ -2229,6 +2231,7 @@ mod tests {
             user_display_name: None,
             discoverable: "true".to_string().encrypt(ctx, key).unwrap(),
             creation_date: "2024-06-07T14:12:36.150Z".parse().unwrap(),
+            extension_state: None,
         }
     }
 

@@ -1,3 +1,5 @@
+use std::fmt;
+
 use bitwarden_api_api::models::{CipherLoginModel, CipherLoginUriModel};
 use bitwarden_core::{
     key_management::{KeySlotIds, SymmetricKeySlotId},
@@ -16,6 +18,7 @@ use subtle::ConstantTimeEq;
 use tsify::Tsify;
 #[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::wasm_bindgen;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use super::cipher::{CipherKind, StrictDecrypt};
 use crate::{Cipher, PasswordHistoryView, VaultParseError, cipher::cipher::CopyableCipherFields};
@@ -84,9 +87,59 @@ impl LoginUriView {
     }
 }
 
+/// Decrypted view of FIDO2 extension state.
+///
+/// Serialized as JSON and encrypted as a single opaque `EncString` in [`Fido2Credential`].
+/// The server never sees the individual fields — it stores one encrypted string.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Zeroize, ZeroizeOnDrop)]
+#[serde(rename_all = "camelCase")]
+// Intentionally not a UniFFI record: mobile bindings only need the encrypted
+// `Fido2Credential::extension_state`, never the decoded HMAC seeds.
+#[cfg_attr(feature = "wasm", derive(Tsify), tsify(into_wasm_abi, from_wasm_abi))]
+pub struct Fido2ExtensionStateView {
+    /// Identifier for the FIDO hmac-secret/PRF algorithm.
+    pub prf_hmac_algorithm: String,
+    /// Base64url-encoded 32-byte HMAC seed used after user verification.
+    pub uv_hmac_seed: String,
+    /// Optional base64url-encoded 32-byte HMAC seed used without user verification.
+    pub non_uv_hmac_seed: Option<String>,
+    /// Optional base64url-encoded credential blob.
+    pub cred_blob: Option<String>,
+    /// Optional serialized WebAuthn large-blob state.
+    pub large_blob: Option<String>,
+    /// Private-key algorithm metadata retained with the extension state.
+    pub key_algorithm_metadata: String,
+}
+
+// Binding-surface regression gate: adding `uniffi::Record` here would make the raw seeds visible
+// in generated Swift/Kotlin models. Mobile callers only receive the encrypted extension string.
+#[cfg(all(test, feature = "uniffi"))]
+static_assertions::assert_not_impl_any!(
+    Fido2ExtensionStateView:
+        uniffi::Lower<crate::UniFfiTag>,
+        uniffi::Lift<crate::UniFfiTag>,
+        uniffi::TypeId<crate::UniFfiTag>
+);
+
+impl fmt::Debug for Fido2ExtensionStateView {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Fido2ExtensionStateView")
+            .field("prf_hmac_algorithm", &self.prf_hmac_algorithm)
+            .field("uv_hmac_seed", &"<redacted>")
+            .field(
+                "non_uv_hmac_seed",
+                &self.non_uv_hmac_seed.as_ref().map(|_| "<redacted>"),
+            )
+            .field("cred_blob_present", &self.cred_blob.is_some())
+            .field("large_blob_present", &self.large_blob.is_some())
+            .field("key_algorithm_metadata", &self.key_algorithm_metadata)
+            .finish()
+    }
+}
+
 #[allow(missing_docs)]
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 #[cfg_attr(feature = "wasm", derive(Tsify), tsify(into_wasm_abi, from_wasm_abi))]
 pub struct Fido2Credential {
@@ -103,6 +156,11 @@ pub struct Fido2Credential {
     pub user_display_name: Option<EncString>,
     pub discoverable: EncString,
     pub creation_date: DateTime<Utc>,
+    /// Optional encrypted FIDO2 extension state (opaque encrypted string).
+    /// Contains PRF/HMAC seed state, blobs, and key metadata for portable passkeys.
+    /// Absent on existing passkey ciphers and passkeys without PRF/HMAC extension state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension_state: Option<EncString>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -139,13 +197,17 @@ pub struct Fido2CredentialView {
     pub user_display_name: Option<String>,
     pub discoverable: String,
     pub creation_date: DateTime<Utc>,
+    /// Encrypted extension state. Kept encrypted in the partial view, like `key_value`.
+    pub extension_state: Option<EncString>,
 }
 
 // This is mostly a copy of the Fido2CredentialView, but with the key exposed
 // Only meant to be used internally and not exposed to the outside world
 #[allow(missing_docs)]
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+// This remains a Wasm input for the legacy `CiphersClient::set_fido2_credentials` encryption
+// boundary. It is deliberately not exposed through UniFFI and is not returned by a Wasm API.
 #[cfg_attr(feature = "wasm", derive(Tsify), tsify(into_wasm_abi, from_wasm_abi))]
 pub struct Fido2CredentialFullView {
     pub credential_id: String,
@@ -161,6 +223,33 @@ pub struct Fido2CredentialFullView {
     pub user_display_name: Option<String>,
     pub discoverable: String,
     pub creation_date: DateTime<Utc>,
+    pub extension_state: Option<Fido2ExtensionStateView>,
+}
+
+impl fmt::Debug for Fido2CredentialFullView {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Fido2CredentialFullView")
+            .field("key_type", &self.key_type)
+            .field("key_algorithm", &self.key_algorithm)
+            .field("key_curve", &self.key_curve)
+            .field("key_value", &"<redacted>")
+            .field("counter", &self.counter)
+            .field("discoverable", &self.discoverable)
+            .field("creation_date", &self.creation_date)
+            .field("extension_state", &self.extension_state)
+            .finish()
+    }
+}
+
+/// Clears the decrypted private key and extension secrets when this view is used through a
+/// [`Zeroizing`] guard. This type cannot implement `ZeroizeOnDrop`: its `String` fields are part of
+/// move-based SDK/Wasm conversion contracts. Default SDK builds therefore also rely on
+/// `bitwarden_crypto`'s global `ZeroizingAllocator` when an unguarded view is dropped.
+impl Zeroize for Fido2CredentialFullView {
+    fn zeroize(&mut self) {
+        self.key_value.zeroize();
+        self.extension_state.zeroize();
+    }
 }
 
 // This is mostly a copy of the Fido2CredentialView, meant to be exposed to the clients
@@ -211,6 +300,16 @@ impl CompositeEncryptable<KeySlotIds, SymmetricKeySlotId, Fido2Credential>
         ctx: &mut KeyStoreContext<KeySlotIds>,
         key: SymmetricKeySlotId,
     ) -> Result<Fido2Credential, CryptoError> {
+        let extension_state = self
+            .extension_state
+            .as_ref()
+            .map(|es| {
+                let json = Zeroizing::new(
+                    serde_json::to_string(es).map_err(|_| CryptoError::InvalidUtf8String)?,
+                );
+                json.as_str().encrypt(ctx, key)
+            })
+            .transpose()?;
         Ok(Fido2Credential {
             credential_id: self.credential_id.encrypt(ctx, key)?,
             key_type: self.key_type.encrypt(ctx, key)?,
@@ -229,6 +328,7 @@ impl CompositeEncryptable<KeySlotIds, SymmetricKeySlotId, Fido2Credential>
             user_display_name: self.user_display_name.encrypt(ctx, key)?,
             discoverable: self.discoverable.encrypt(ctx, key)?,
             creation_date: self.creation_date,
+            extension_state,
         })
     }
 }
@@ -239,6 +339,16 @@ impl Decryptable<KeySlotIds, SymmetricKeySlotId, Fido2CredentialFullView> for Fi
         ctx: &mut KeyStoreContext<KeySlotIds>,
         key: SymmetricKeySlotId,
     ) -> Result<Fido2CredentialFullView, CryptoError> {
+        let extension_state = self
+            .extension_state
+            .as_ref()
+            .map(|es| {
+                let json: String = es.decrypt(ctx, key)?;
+                let json = Zeroizing::new(json);
+                serde_json::from_str::<Fido2ExtensionStateView>(json.as_str())
+                    .map_err(|_| CryptoError::Decrypt)
+            })
+            .transpose()?;
         Ok(Fido2CredentialFullView {
             credential_id: self.credential_id.decrypt(ctx, key)?,
             key_type: self.key_type.decrypt(ctx, key)?,
@@ -253,6 +363,7 @@ impl Decryptable<KeySlotIds, SymmetricKeySlotId, Fido2CredentialFullView> for Fi
             user_display_name: self.user_display_name.decrypt(ctx, key)?,
             discoverable: self.discoverable.decrypt(ctx, key)?,
             creation_date: self.creation_date,
+            extension_state,
         })
     }
 }
@@ -263,6 +374,16 @@ impl Decryptable<KeySlotIds, SymmetricKeySlotId, Fido2CredentialFullView> for Fi
         ctx: &mut KeyStoreContext<KeySlotIds>,
         key: SymmetricKeySlotId,
     ) -> Result<Fido2CredentialFullView, CryptoError> {
+        let extension_state = self
+            .extension_state
+            .as_ref()
+            .map(|es| {
+                let json: String = es.decrypt(ctx, key)?;
+                let json = Zeroizing::new(json);
+                serde_json::from_str::<Fido2ExtensionStateView>(json.as_str())
+                    .map_err(|_| CryptoError::Decrypt)
+            })
+            .transpose()?;
         Ok(Fido2CredentialFullView {
             credential_id: self.credential_id.clone(),
             key_type: self.key_type.clone(),
@@ -277,6 +398,7 @@ impl Decryptable<KeySlotIds, SymmetricKeySlotId, Fido2CredentialFullView> for Fi
             user_display_name: self.user_display_name.clone(),
             discoverable: self.discoverable.clone(),
             creation_date: self.creation_date,
+            extension_state,
         })
     }
 }
@@ -335,6 +457,7 @@ impl LoginView {
     ) -> Result<(), CryptoError> {
         if let Some(creds) = &mut self.fido2_credentials {
             let decrypted_creds: Vec<Fido2CredentialFullView> = creds.decrypt(ctx, old_key)?;
+            let decrypted_creds = Zeroizing::new(decrypted_creds);
             *creds = decrypted_creds.encrypt_composite(ctx, new_key)?;
         }
         Ok(())
@@ -570,6 +693,7 @@ impl CompositeEncryptable<KeySlotIds, SymmetricKeySlotId, Fido2Credential> for F
             user_display_name: self.user_display_name.encrypt(ctx, key)?,
             discoverable: self.discoverable.encrypt(ctx, key)?,
             creation_date: self.creation_date,
+            extension_state: self.extension_state.clone(),
         })
     }
 }
@@ -594,6 +718,7 @@ impl Decryptable<KeySlotIds, SymmetricKeySlotId, Fido2CredentialView> for Fido2C
             user_display_name: self.user_display_name.decrypt(ctx, key)?,
             discoverable: self.discoverable.decrypt(ctx, key)?,
             creation_date: self.creation_date,
+            extension_state: self.extension_state.clone(),
         })
     }
 }
@@ -676,6 +801,11 @@ impl TryFrom<bitwarden_api_api::models::CipherFido2CredentialModel> for Fido2Cre
     fn try_from(
         value: bitwarden_api_api::models::CipherFido2CredentialModel,
     ) -> Result<Self, Self::Error> {
+        let extension_state = value
+            .extension_state
+            .as_ref()
+            .map(|s| s.parse::<EncString>())
+            .transpose()?;
         Ok(Self {
             credential_id: require!(value.credential_id).parse()?,
             key_type: require!(value.key_type).parse()?,
@@ -694,6 +824,7 @@ impl TryFrom<bitwarden_api_api::models::CipherFido2CredentialModel> for Fido2Cre
                 .flatten(),
             discoverable: require!(value.discoverable).parse()?,
             creation_date: value.creation_date.parse()?,
+            extension_state,
         })
     }
 }
@@ -739,6 +870,7 @@ impl From<Fido2Credential> for bitwarden_api_api::models::CipherFido2CredentialM
             user_display_name: cred.user_display_name.map(|n| n.to_string()),
             discoverable: Some(cred.discoverable.to_string()),
             creation_date: cred.creation_date.to_rfc3339(),
+            extension_state: cred.extension_state.map(|e| e.to_string()),
         }
     }
 }
@@ -795,6 +927,31 @@ mod tests {
         Login,
         cipher::cipher::{CipherKind, CopyableCipherFields},
     };
+
+    #[test]
+    fn fido2_extension_state_zeroizes_and_zeroizes_on_drop() {
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+
+        assert_zeroize_on_drop::<super::Fido2ExtensionStateView>();
+
+        let mut state = super::Fido2ExtensionStateView {
+            prf_hmac_algorithm: "hmac-secret".to_string(),
+            uv_hmac_seed: "uv-seed".to_string(),
+            non_uv_hmac_seed: Some("non-uv-seed".to_string()),
+            cred_blob: Some("credential-blob".to_string()),
+            large_blob: Some("large-blob".to_string()),
+            key_algorithm_metadata: "ES256".to_string(),
+        };
+
+        zeroize::Zeroize::zeroize(&mut state);
+
+        assert!(state.prf_hmac_algorithm.is_empty());
+        assert!(state.uv_hmac_seed.is_empty());
+        assert!(state.non_uv_hmac_seed.is_none());
+        assert!(state.cred_blob.is_none());
+        assert!(state.large_blob.is_none());
+        assert!(state.key_algorithm_metadata.is_empty());
+    }
 
     #[test]
     fn test_valid_checksum() {

@@ -421,7 +421,7 @@ pub struct LoginUri {
 
 #[allow(missing_docs)]
 #[derive(Clone)]
-#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 pub struct Fido2Credential {
     pub credential_id: String,
     pub key_type: String,
@@ -436,6 +436,26 @@ pub struct Fido2Credential {
     pub user_display_name: Option<String>,
     pub discoverable: String,
     pub creation_date: DateTime<Utc>,
+    pub extension_state: Option<String>,
+}
+
+#[cfg(test)]
+impl fmt::Debug for Fido2Credential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Fido2Credential")
+            .field("key_type", &self.key_type)
+            .field("key_algorithm", &self.key_algorithm)
+            .field("key_curve", &self.key_curve)
+            .field("key_value", &"<redacted>")
+            .field("counter", &self.counter)
+            .field("discoverable", &self.discoverable)
+            .field("creation_date", &self.creation_date)
+            .field(
+                "extension_state",
+                &self.extension_state.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 impl From<Fido2Credential> for Fido2CredentialFullView {
@@ -454,6 +474,9 @@ impl From<Fido2Credential> for Fido2CredentialFullView {
             user_display_name: value.user_display_name,
             discoverable: value.discoverable,
             creation_date: value.creation_date,
+            extension_state: value
+                .extension_state
+                .and_then(|s| serde_json::from_str(&s).ok()),
         }
     }
 }
@@ -525,6 +548,33 @@ mod tests {
     use chrono::{DateTime, Utc};
 
     use super::*;
+
+    #[test]
+    fn fido2_credential_debug_redacts_private_material() {
+        let private_key = "private-key-sentinel";
+        let extension_state = "extension-state-with-seeds";
+        let credential = Fido2Credential {
+            credential_id: "credential-id".to_string(),
+            key_type: "public-key".to_string(),
+            key_algorithm: "ECDSA".to_string(),
+            key_curve: "P-256".to_string(),
+            key_value: private_key.to_string(),
+            rp_id: "example.com".to_string(),
+            user_handle: None,
+            user_name: None,
+            counter: 0,
+            rp_name: None,
+            user_display_name: None,
+            discoverable: "true".to_string(),
+            creation_date: Utc::now(),
+            extension_state: Some(extension_state.to_string()),
+        };
+
+        let debug = format!("{credential:?}");
+        assert!(!debug.contains(private_key));
+        assert!(!debug.contains(extension_state));
+        assert!(debug.contains("<redacted>"));
+    }
 
     #[test]
     fn test_importing_cipher_to_cipher_view_login() {

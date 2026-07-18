@@ -5,7 +5,10 @@ use bitwarden_crypto::CryptoError;
 use bitwarden_vault::{CipherError, CipherView, EncryptionContext};
 use itertools::Itertools;
 use passkey::{
-    authenticator::{Authenticator, DiscoverabilitySupport, StoreInfo, UiHint, UserCheck},
+    authenticator::{
+        Authenticator, DiscoverabilitySupport, StoreInfo, UiHint, UserCheck,
+        extensions::HmacSecretConfig,
+    },
     types::{
         Passkey,
         ctap2::{self, Ctap2Error, StatusCode, VendorError},
@@ -13,15 +16,54 @@ use passkey::{
 };
 use thiserror::Error;
 use tracing::error;
+use zeroize::Zeroizing;
 
 use super::{
     AAGUID, CheckUserOptions, CipherViewContainer, Fido2CredentialStore, Fido2UserInterface,
     SelectedCredential, UnknownEnumError, try_from_credential_new_view, types::*,
 };
 use crate::{
-    Fido2CallbackError, FillCredentialError, InvalidGuidError, fill_with_credential,
+    Fido2CallbackError, FillCredentialError, InvalidGuidError,
+    fill_with_credential_preserving_extension_state, stored_hmac_secret_from_extension_state,
     string_to_guid_bytes, try_from_credential_full,
 };
+
+#[derive(Clone, Debug)]
+struct PrfEvaluationContext {
+    has_fallback: bool,
+    credential_ids: Vec<Vec<u8>>,
+}
+
+impl PrfEvaluationContext {
+    fn from_request(request: &GetAssertionRequest) -> Option<Self> {
+        let prf = request.extensions.as_ref()?.prf.as_ref()?;
+        let credential_ids: Vec<Vec<u8>> = prf
+            .eval_by_credential
+            .as_ref()
+            .map(|values| values.keys().cloned().collect())
+            .unwrap_or_default();
+        let has_fallback = prf.eval.is_some();
+
+        (has_fallback || !credential_ids.is_empty()).then_some(Self {
+            has_fallback,
+            credential_ids,
+        })
+    }
+
+    fn applies_to(&self, credential_id: &[u8]) -> bool {
+        self.has_fallback
+            || self
+                .credential_ids
+                .iter()
+                .any(|candidate| candidate == credential_id)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PrfValidationFailure {
+    MissingSeedState,
+    InvalidSeedState,
+}
 
 #[derive(Debug, Error)]
 pub enum GetSelectedCredentialError {
@@ -42,6 +84,8 @@ pub enum MakeCredentialError {
     PublicKeyCredentialParameters(#[from] PublicKeyCredentialParametersError),
     #[error(transparent)]
     UnknownEnum(#[from] UnknownEnumError),
+    #[error(transparent)]
+    InvalidPrfInput(#[from] InvalidPrfInputLengthError),
     #[error("Missing attested_credential_data")]
     MissingAttestedCredentialData,
     #[error("make_credential error: {0}")]
@@ -58,8 +102,19 @@ pub enum GetAssertionError {
     GetSelectedCredential(#[from] GetSelectedCredentialError),
     #[error(transparent)]
     InvalidGuid(#[from] InvalidGuidError),
+    #[error(transparent)]
+    InvalidPrfInput(#[from] InvalidPrfInputLengthError),
     #[error("missing user")]
     MissingUser,
+    /// PRF was requested but the credential has no HMAC seed state at all.
+    #[error("PRF evaluation failed: no HMAC seed state present in credential")]
+    PrfMissingSeedState,
+    /// PRF was requested but the stored HMAC seed state could not be validated.
+    #[error("PRF evaluation failed: invalid HMAC seed state")]
+    PrfInvalidSeedState,
+    /// PRF evaluation applied to the selected credential but no result was produced.
+    #[error("PRF evaluation failed: authenticator produced no PRF output")]
+    PrfOutputMissing,
     #[error("get_assertion error: {0}")]
     Other(String),
 }
@@ -100,6 +155,8 @@ pub struct Fido2Authenticator<'a> {
 
     pub(crate) selected_cipher: Mutex<Option<CipherView>>,
     pub(crate) requested_uv: Mutex<Option<UV>>,
+    prf_evaluation: Mutex<Option<PrfEvaluationContext>>,
+    prf_validation_failure: Mutex<Option<PrfValidationFailure>>,
 }
 
 impl<'a> Fido2Authenticator<'a> {
@@ -115,6 +172,8 @@ impl<'a> Fido2Authenticator<'a> {
             credential_store,
             selected_cipher: Mutex::new(None),
             requested_uv: Mutex::new(None),
+            prf_evaluation: Mutex::new(None),
+            prf_validation_failure: Mutex::new(None),
         }
     }
 
@@ -123,11 +182,21 @@ impl<'a> Fido2Authenticator<'a> {
         &mut self,
         request: MakeCredentialRequest,
     ) -> Result<MakeCredentialResult, MakeCredentialError> {
-        // Insert the received UV to be able to return it later in check_user
+        let evaluates_prf = request
+            .extensions
+            .as_ref()
+            .and_then(|extensions| extensions.prf.as_ref())
+            .is_some_and(|prf| prf.eval.is_some());
+        let effective_uv = evaluates_prf
+            .then_some(UV::Required)
+            .unwrap_or(request.options.uv);
+
+        // WebAuthn PRF evaluation is only available with user verification. Store the
+        // effective requirement so the UI sees the same value as the CTAP request.
         self.requested_uv
             .get_mut()
             .expect("Mutex is not poisoned")
-            .replace(request.options.uv);
+            .replace(effective_uv);
 
         let mut authenticator = self.get_authenticator(true);
 
@@ -155,13 +224,11 @@ impl<'a> Fido2Authenticator<'a> {
                 // TODO(PM-30510): Even though we forward the extensions to the
                 // authenticator, they will not be processed until they are
                 // enabled in the authenticator configuration.
-                extensions: request
-                    .extensions
-                    .map(passkey::types::ctap2::make_credential::ExtensionInputs::from),
+                extensions: request.extensions.map(TryInto::try_into).transpose()?,
                 options: passkey::types::ctap2::make_credential::Options {
                     rk: request.options.rk,
                     up: true,
-                    uv: self.convert_requested_uv(request.options.uv),
+                    uv: self.convert_requested_uv(effective_uv),
                 },
                 pin_auth: None,
                 pin_protocol: None,
@@ -180,7 +247,7 @@ impl<'a> Fido2Authenticator<'a> {
             .attested_credential_data
             .ok_or(MakeCredentialError::MissingAttestedCredentialData)?;
         let credential_id = attested_credential_data.credential_id().to_vec();
-        let extensions = response.unsigned_extension_outputs.into();
+        let extensions: MakeCredentialExtensionsOutput = response.unsigned_extension_outputs.into();
 
         Ok(MakeCredentialResult {
             authenticator_data,
@@ -195,41 +262,78 @@ impl<'a> Fido2Authenticator<'a> {
         &mut self,
         request: GetAssertionRequest,
     ) -> Result<GetAssertionResult, GetAssertionError> {
-        // Insert the received UV to be able to return it later in check_user
+        let prf_evaluation = PrfEvaluationContext::from_request(&request);
+        let effective_uv = prf_evaluation
+            .is_some()
+            .then_some(UV::Required)
+            .unwrap_or(request.options.uv);
+
+        // Per-request state must never leak from a previous assertion ceremony.
+        self.selected_cipher
+            .get_mut()
+            .expect("Mutex is not poisoned")
+            .take();
+        self.prf_validation_failure
+            .get_mut()
+            .expect("Mutex is not poisoned")
+            .take();
+        *self
+            .prf_evaluation
+            .get_mut()
+            .expect("Mutex is not poisoned") = prf_evaluation.clone();
+
+        // WebAuthn PRF evaluation is only available with user verification. Store the
+        // effective requirement so the UI sees the same value as the CTAP request.
         self.requested_uv
             .get_mut()
             .expect("Mutex is not poisoned")
-            .replace(request.options.uv);
+            .replace(effective_uv);
 
-        let mut authenticator = self.get_authenticator(false);
+        let response = {
+            let mut authenticator = self.get_authenticator(false);
+            authenticator
+                .get_assertion(ctap2::get_assertion::Request {
+                    rp_id: request.rp_id,
+                    client_data_hash: request.client_data_hash.into(),
+                    allow_list: request
+                        .allow_list
+                        .map(|l| {
+                            l.into_iter()
+                                .map(TryInto::try_into)
+                                .collect::<Result<Vec<_>, _>>()
+                        })
+                        .transpose()?,
+                    // TODO(PM-30510): Even though we forward the extensions to the
+                    // authenticator, they will not be processed until they are
+                    // enabled in the authenticator configuration.
+                    extensions: request.extensions.map(TryInto::try_into).transpose()?,
+                    options: passkey::types::ctap2::make_credential::Options {
+                        rk: request.options.rk,
+                        up: true,
+                        uv: self.convert_requested_uv(effective_uv),
+                    },
+                    pin_auth: None,
+                    pin_protocol: None,
+                })
+                .await
+        };
 
-        let response = authenticator
-            .get_assertion(ctap2::get_assertion::Request {
-                rp_id: request.rp_id,
-                client_data_hash: request.client_data_hash.into(),
-                allow_list: request
-                    .allow_list
-                    .map(|l| {
-                        l.into_iter()
-                            .map(TryInto::try_into)
-                            .collect::<Result<Vec<_>, _>>()
-                    })
-                    .transpose()?,
-                // TODO(PM-30510): Even though we forward the extensions to the
-                // authenticator, they will not be processed until they are
-                // enabled in the authenticator configuration.
-                extensions: request
-                    .extensions
-                    .map(passkey::types::ctap2::get_assertion::ExtensionInputs::from),
-                options: passkey::types::ctap2::make_credential::Options {
-                    rk: request.options.rk,
-                    up: true,
-                    uv: self.convert_requested_uv(request.options.uv),
-                },
-                pin_auth: None,
-                pin_protocol: None,
-            })
-            .await;
+        self.prf_evaluation
+            .get_mut()
+            .expect("Mutex is not poisoned")
+            .take();
+
+        if let Some(failure) = self
+            .prf_validation_failure
+            .get_mut()
+            .expect("Mutex is not poisoned")
+            .take()
+        {
+            return Err(match failure {
+                PrfValidationFailure::MissingSeedState => GetAssertionError::PrfMissingSeedState,
+                PrfValidationFailure::InvalidSeedState => GetAssertionError::PrfInvalidSeedState,
+            });
+        }
 
         let response = match response {
             Ok(x) => x,
@@ -239,7 +343,15 @@ impl<'a> Fido2Authenticator<'a> {
         let selected_credential = self.get_selected_credential()?;
         let authenticator_data = response.auth_data.to_vec();
         let credential_id = string_to_guid_bytes(&selected_credential.credential.credential_id)?;
-        let extensions = response.unsigned_extension_outputs.into();
+        let extensions: GetAssertionExtensionsOutput = response.unsigned_extension_outputs.into();
+
+        if prf_evaluation
+            .as_ref()
+            .is_some_and(|context| context.applies_to(&credential_id))
+            && extensions.prf.is_none()
+        {
+            return Err(GetAssertionError::PrfOutputMissing);
+        }
 
         Ok(GetAssertionResult {
             credential_id,
@@ -301,7 +413,7 @@ impl<'a> Fido2Authenticator<'a> {
         &self,
         create_credential: bool,
     ) -> Authenticator<CredentialStoreImpl<'_>, UserValidationMethodImpl<'_>> {
-        Authenticator::new(
+        let authenticator = Authenticator::new(
             AAGUID,
             CredentialStoreImpl {
                 authenticator: self,
@@ -310,7 +422,12 @@ impl<'a> Fido2Authenticator<'a> {
             UserValidationMethodImpl {
                 authenticator: self,
             },
-        )
+        );
+
+        // This SDK surface implements WebAuthn PRF, whose hmac-secret evaluation is UV-only.
+        // Imported non-UV CTAP metadata remains in the credential for portability, but this
+        // configuration prevents WebAuthn PRF from ever selecting it.
+        authenticator.hmac_secret(HmacSecretConfig::new_with_uv_only().enable_on_make_credential())
     }
 
     fn convert_requested_uv(&self, uv: UV) -> bool {
@@ -321,6 +438,60 @@ impl<'a> Fido2Authenticator<'a> {
             (UV::Required, _) => true,
             (UV::Discouraged, _) => false,
         }
+    }
+
+    fn fail_prf_validation(&self, failure: PrfValidationFailure) -> Ctap2Error {
+        self.prf_validation_failure
+            .lock()
+            .expect("Mutex is not poisoned")
+            .replace(failure);
+
+        match failure {
+            PrfValidationFailure::MissingSeedState => Ctap2Error::MissingParameter,
+            PrfValidationFailure::InvalidSeedState => Ctap2Error::InvalidCredential,
+        }
+    }
+
+    fn validate_selected_prf_state(&self) -> Result<(), Ctap2Error> {
+        let Some(context) = self
+            .prf_evaluation
+            .lock()
+            .expect("Mutex is not poisoned")
+            .clone()
+        else {
+            return Ok(());
+        };
+
+        let Some(selected_cipher) = self
+            .selected_cipher
+            .lock()
+            .expect("Mutex is not poisoned")
+            .clone()
+        else {
+            // The normal passkey-rs no-credentials path remains authoritative.
+            return Ok(());
+        };
+
+        let key_store = self.client.internal.get_key_store();
+        let credentials = selected_cipher
+            .get_fido2_credentials(&mut key_store.context())
+            .map_err(|_| self.fail_prf_validation(PrfValidationFailure::InvalidSeedState))?;
+        let credentials = Zeroizing::new(credentials);
+        let credential = credentials
+            .first()
+            .ok_or_else(|| self.fail_prf_validation(PrfValidationFailure::InvalidSeedState))?;
+        let credential_id = string_to_guid_bytes(&credential.credential_id)
+            .map_err(|_| self.fail_prf_validation(PrfValidationFailure::InvalidSeedState))?;
+
+        if !context.applies_to(&credential_id) {
+            return Ok(());
+        }
+
+        stored_hmac_secret_from_extension_state(credential.extension_state.as_ref())
+            .map_err(|_| self.fail_prf_validation(PrfValidationFailure::InvalidSeedState))?
+            .ok_or_else(|| self.fail_prf_validation(PrfValidationFailure::MissingSeedState))?;
+
+        Ok(())
     }
 
     pub(super) fn get_selected_credential(
@@ -528,6 +699,8 @@ impl passkey::authenticator::CredentialStore for CredentialStoreImpl<'_> {
             InvalidGuid(#[from] InvalidGuidError),
             #[error("Credential ID does not match selected credential")]
             CredentialIdMismatch,
+            #[error("Selected full credential could not be found")]
+            FullCredentialNotFound,
             #[error(transparent)]
             FillCredential(#[from] FillCredentialError),
             #[error(transparent)]
@@ -561,9 +734,28 @@ impl passkey::authenticator::CredentialStore for CredentialStoreImpl<'_> {
                 return Err(InnerError::CredentialIdMismatch);
             }
 
-            let cred = fill_with_credential(&selected.credential, cred)?;
-
             let key_store = this.authenticator.client.internal.get_key_store();
+            let cred = {
+                let existing_credentials = Zeroizing::new(
+                    selected
+                        .cipher
+                        .get_fido2_credentials(&mut key_store.context())?,
+                );
+                let existing_extension_state = existing_credentials
+                    .iter()
+                    .find(|credential| {
+                        credential.credential_id == selected.credential.credential_id
+                    })
+                    .ok_or(InnerError::FullCredentialNotFound)?
+                    .extension_state
+                    .as_ref();
+
+                fill_with_credential_preserving_extension_state(
+                    &selected.credential,
+                    cred,
+                    existing_extension_state,
+                )?
+            };
 
             let mut selected = selected.cipher;
             selected.set_new_fido2_credentials(&mut key_store.context(), vec![cred])?;
@@ -612,7 +804,7 @@ impl passkey::authenticator::UserValidationMethod for UserValidationMethodImpl<'
         &self,
         hint: UiHint<'a, Self::PasskeyItem>,
         presence: bool,
-        _verification: bool,
+        requested_verification: bool,
     ) -> Result<UserCheck, Ctap2Error> {
         let verification = self
             .authenticator
@@ -659,6 +851,13 @@ impl passkey::authenticator::UserValidationMethod for UserValidationMethodImpl<'
             Ctap2Error::UserVerificationInvalid
         })?;
 
+        // Validate the selected credential's PRF seed state before passkey-rs can
+        // increment its counter, persist it, calculate extension output, or sign.
+        // If requested UV failed, passkey-rs must return OperationDenied first.
+        if !requested_verification || result.user_verified {
+            self.authenticator.validate_selected_prf_state()?;
+        }
+
         Ok(UserCheck {
             presence: result.user_present,
             verification: result.user_verified,
@@ -686,39 +885,89 @@ fn map_ui_hint(hint: UiHint<'_, CipherViewContainer>) -> UiHint<'_, CipherView> 
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::HashMap, sync::Mutex};
+
     use async_trait::async_trait;
     use bitwarden_core::{
-        Client,
+        Client, UserId,
         key_management::{KeySlotIds, SymmetricKeySlotId},
     };
     use bitwarden_crypto::{KeyStoreContext, PrimitiveEncryptable, SymmetricCryptoKey};
     use bitwarden_encoding::B64Url;
     use bitwarden_vault::{
         CipherListView, CipherRepromptType, CipherType, CipherView, EncryptionContext,
-        Fido2Credential, Fido2CredentialNewView, LoginView,
+        Fido2Credential, Fido2CredentialNewView, Fido2ExtensionStateView, LoginView,
     };
     use passkey::authenticator::UiHint;
 
-    use super::Fido2Authenticator;
+    use super::{Fido2Authenticator, GetAssertionError};
     use crate::{
-        CheckUserOptions, CheckUserResult, Fido2CallbackError, Fido2CredentialStore,
-        Fido2UserInterface, GetAssertionExtensionsInput, GetAssertionPrfInput, PrfInputValues,
-        guid_bytes_to_string,
-        types::{GetAssertionRequest, Options, UV},
+        CheckUserOptions, CheckUserResult, Fido2CallbackError, Fido2Client, Fido2CredentialStore,
+        Fido2UserInterface, GetAssertionExtensionsInput, GetAssertionPrfInput,
+        MakeCredentialExtensionsInput, MakeCredentialPrfInput, MakeCredentialRequest,
+        PrfInputValues, PublicKeyCredentialRpEntity, PublicKeyCredentialUserEntity, Verification,
+        guid_bytes_to_string, string_to_guid_bytes,
+        types::{
+            ClientData, GetAssertionRequest, Options, Origin, PublicKeyCredentialParameters, UV,
+        },
     };
 
-    struct MockUserInterface;
+    struct MockUserInterface {
+        user_verified: bool,
+        creation_cipher: Option<CipherView>,
+        seen_verifications: Mutex<Vec<Verification>>,
+    }
+
+    impl MockUserInterface {
+        fn verified() -> Self {
+            Self {
+                user_verified: true,
+                creation_cipher: None,
+                seen_verifications: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn unverified() -> Self {
+            Self {
+                user_verified: false,
+                creation_cipher: None,
+                seen_verifications: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn for_creation(cipher: CipherView, user_verified: bool) -> Self {
+            Self {
+                user_verified,
+                creation_cipher: Some(cipher),
+                seen_verifications: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn assert_last_verification_required(&self) {
+            assert!(matches!(
+                self.seen_verifications
+                    .lock()
+                    .expect("Mutex is not poisoned")
+                    .last(),
+                Some(Verification::Required)
+            ));
+        }
+    }
 
     #[async_trait]
     impl Fido2UserInterface for MockUserInterface {
         async fn check_user<'a>(
             &self,
-            _options: CheckUserOptions,
+            options: CheckUserOptions,
             _hint: UiHint<'a, CipherView>,
         ) -> Result<CheckUserResult, Fido2CallbackError> {
+            self.seen_verifications
+                .lock()
+                .expect("Mutex is not poisoned")
+                .push(options.require_verification);
             Ok(CheckUserResult {
                 user_present: true,
-                user_verified: true,
+                user_verified: self.user_verified,
             })
         }
 
@@ -734,10 +983,23 @@ mod tests {
 
         async fn check_user_and_pick_credential_for_creation(
             &self,
-            _options: CheckUserOptions,
+            options: CheckUserOptions,
             _new_credential: Fido2CredentialNewView,
         ) -> Result<(CipherView, CheckUserResult), Fido2CallbackError> {
-            unimplemented!("not needed for this test")
+            self.seen_verifications
+                .lock()
+                .expect("Mutex is not poisoned")
+                .push(options.require_verification);
+            let cipher = self.creation_cipher.clone().ok_or_else(|| {
+                Fido2CallbackError::Unknown("creation cipher was not configured".to_string())
+            })?;
+            Ok((
+                cipher,
+                CheckUserResult {
+                    user_present: true,
+                    user_verified: self.user_verified,
+                },
+            ))
         }
 
         fn is_verification_enabled(&self) -> bool {
@@ -747,6 +1009,20 @@ mod tests {
 
     struct MockCredentialStore {
         cipher: CipherView,
+        saved: Mutex<Vec<EncryptionContext>>,
+    }
+
+    impl MockCredentialStore {
+        fn new(cipher: CipherView) -> Self {
+            Self {
+                cipher,
+                saved: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn saved_credentials(&self) -> Vec<EncryptionContext> {
+            self.saved.lock().expect("Mutex is not poisoned").clone()
+        }
     }
 
     #[async_trait]
@@ -764,10 +1040,8 @@ mod tests {
             Ok(vec![])
         }
 
-        async fn save_credential(
-            &self,
-            _cred: EncryptionContext,
-        ) -> Result<(), Fido2CallbackError> {
+        async fn save_credential(&self, cred: EncryptionContext) -> Result<(), Fido2CallbackError> {
+            self.saved.lock().expect("Mutex is not poisoned").push(cred);
             Ok(())
         }
     }
@@ -789,9 +1063,138 @@ mod tests {
         0x84, 0x05, 0x71,
     ];
 
+    fn create_client() -> Client {
+        let client = Client::new(None);
+        let user_key: SymmetricCryptoKey =
+            "w2LO+nwV4oxwswVYCxlOfRUseXfvU03VzvKQHrqeklPgiMZrspUe6sOBToCnDn9Ay0tuCBn8ykVVRb7PWhub2Q=="
+                .to_string()
+                .try_into()
+                .unwrap();
+
+        #[allow(deprecated)]
+        client
+            .internal
+            .get_key_store()
+            .context_mut()
+            .set_symmetric_key(SymmetricKeySlotId::User, user_key)
+            .unwrap();
+
+        client
+    }
+
+    async fn initialize_user(client: &Client) {
+        client
+            .internal
+            .init_user_id(UserId::new(
+                "14a55cce-9914-4b4e-83f8-870e8c480115".parse().unwrap(),
+            ))
+            .await
+            .unwrap();
+    }
+
+    fn extension_state(non_uv_seed: Option<Vec<u8>>) -> Fido2ExtensionStateView {
+        Fido2ExtensionStateView {
+            prf_hmac_algorithm: "hmac-secret".to_string(),
+            uv_hmac_seed: B64Url::from(vec![0x11; 32]).to_string(),
+            non_uv_hmac_seed: non_uv_seed.map(|seed| B64Url::from(seed).to_string()),
+            cred_blob: None,
+            large_blob: None,
+            key_algorithm_metadata: "ES256".to_string(),
+        }
+    }
+
+    fn prf_request(
+        uv: UV,
+        eval: Option<PrfInputValues>,
+        eval_by_credential: Option<HashMap<Vec<u8>, PrfInputValues>>,
+    ) -> GetAssertionRequest {
+        GetAssertionRequest {
+            rp_id: TEST_FIDO_RP_ID.to_string(),
+            client_data_hash: vec![0; 32],
+            allow_list: None,
+            options: Options { rk: false, uv },
+            extensions: Some(GetAssertionExtensionsInput {
+                prf: Some(GetAssertionPrfInput {
+                    eval,
+                    eval_by_credential,
+                }),
+            }),
+        }
+    }
+
+    fn make_prf_request(uv: UV) -> MakeCredentialRequest {
+        MakeCredentialRequest {
+            client_data_hash: vec![0; 32],
+            rp: PublicKeyCredentialRpEntity {
+                id: TEST_FIDO_RP_ID.to_string(),
+                name: Some("Example".to_string()),
+            },
+            user: PublicKeyCredentialUserEntity {
+                id: b"new-user".to_vec(),
+                display_name: "New User".to_string(),
+                name: "new-user@example.com".to_string(),
+            },
+            pub_key_cred_params: vec![PublicKeyCredentialParameters {
+                ty: "public-key".to_string(),
+                alg: -7,
+            }],
+            exclude_list: None,
+            options: Options { rk: true, uv },
+            extensions: Some(MakeCredentialExtensionsInput {
+                prf: Some(MakeCredentialPrfInput {
+                    eval: Some(PrfInputValues {
+                        first: b"registration-prf".to_vec(),
+                        second: None,
+                        already_hashed: false,
+                    }),
+                }),
+            }),
+        }
+    }
+
+    fn expected_prf(seed: &[u8], input: &[u8]) -> Vec<u8> {
+        let hashed_input =
+            passkey::types::crypto::sha256(&[b"WebAuthn PRF\0".as_slice(), input].concat());
+        passkey::types::crypto::hmac_sha256(seed, &hashed_input).to_vec()
+    }
+
+    fn native_prf_request(extension_name: &str, encoded_input: String) -> String {
+        let mut request = serde_json::json!({
+            "publicKey": {
+                "challenge": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "rpId": TEST_FIDO_RP_ID,
+                "userVerification": "discouraged"
+            }
+        });
+        request["publicKey"]["extensions"][extension_name] = serde_json::json!({
+            "eval": { "first": encoded_input }
+        });
+        request.to_string()
+    }
+
     fn create_test_cipher(ctx: &mut KeyStoreContext<KeySlotIds>) -> CipherView {
+        create_test_cipher_with_extension(ctx, None)
+    }
+
+    fn create_test_cipher_with_extension(
+        ctx: &mut KeyStoreContext<KeySlotIds>,
+        extension_state: Option<Fido2ExtensionStateView>,
+    ) -> CipherView {
+        create_test_cipher_with_extension_and_counter(ctx, extension_state, "0")
+    }
+
+    fn create_test_cipher_with_extension_and_counter(
+        ctx: &mut KeyStoreContext<KeySlotIds>,
+        extension_state: Option<Fido2ExtensionStateView>,
+        counter: &str,
+    ) -> CipherView {
         let key = SymmetricKeySlotId::User;
         let key_value = B64Url::from(TEST_FIDO_P256_KEY).to_string();
+
+        let extension_state_enc = extension_state.map(|es| {
+            let json = serde_json::to_string(&es).unwrap();
+            json.encrypt(ctx, key).unwrap()
+        });
 
         let fido2_credential = Fido2Credential {
             credential_id: TEST_FIDO_CREDENTIAL_ID.encrypt(ctx, key).unwrap(),
@@ -802,11 +1205,12 @@ mod tests {
             rp_id: TEST_FIDO_RP_ID.encrypt(ctx, key).unwrap(),
             user_handle: Some(TEST_FIDO_USER_HANDLE.encrypt(ctx, key).unwrap()),
             user_name: None,
-            counter: "0".to_string().encrypt(ctx, key).unwrap(),
+            counter: counter.to_string().encrypt(ctx, key).unwrap(),
             rp_name: None,
             user_display_name: None,
             discoverable: "true".to_string().encrypt(ctx, key).unwrap(),
             creation_date: "2024-06-07T14:12:36.150Z".parse().unwrap(),
+            extension_state: extension_state_enc,
         };
 
         CipherView {
@@ -852,12 +1256,427 @@ mod tests {
         }
     }
 
-    /// TODO(PM-30510): Even though we forward the extensions to the
-    /// authenticator, we have disabled the configuration.
-    /// When we implement PRF, this test should be updated to test that PRF _is_
-    /// evaluated when PRF extension input is received.
     #[tokio::test]
-    async fn test_prf_is_not_evaluated() {
+    async fn test_make_credential_prf_eval_overrides_discouraged_to_required() {
+        let client = create_client();
+        initialize_user(&client).await;
+        let cipher = {
+            let mut ctx = client.internal.get_key_store().context();
+            create_test_cipher(&mut ctx)
+        };
+        let user_interface = MockUserInterface::for_creation(cipher.clone(), true);
+        let credential_store = MockCredentialStore::new(cipher);
+        let mut authenticator =
+            Fido2Authenticator::new(&client, &user_interface, &credential_store);
+
+        let result = authenticator
+            .make_credential(make_prf_request(UV::Discouraged))
+            .await
+            .unwrap();
+
+        user_interface.assert_last_verification_required();
+        let prf = result.extensions.prf.unwrap();
+        assert!(prf.enabled);
+        assert_eq!(prf.results.unwrap().first.len(), 32);
+
+        let saved = credential_store.saved_credentials();
+        assert_eq!(saved.len(), 1);
+        let key_store = client.internal.get_key_store();
+        let saved_view: CipherView = key_store.decrypt(&saved[0].cipher).unwrap();
+        let saved_credentials = saved_view
+            .get_fido2_credentials(&mut key_store.context())
+            .unwrap();
+        let state = saved_credentials[0].extension_state.as_ref().unwrap();
+        assert!(state.non_uv_hmac_seed.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_make_credential_prf_eval_fails_without_uv_before_persistence() {
+        let client = create_client();
+        initialize_user(&client).await;
+        let cipher = {
+            let mut ctx = client.internal.get_key_store().context();
+            create_test_cipher(&mut ctx)
+        };
+        let user_interface = MockUserInterface::for_creation(cipher.clone(), false);
+        let credential_store = MockCredentialStore::new(cipher);
+        let mut authenticator =
+            Fido2Authenticator::new(&client, &user_interface, &credential_store);
+
+        let error = authenticator
+            .make_credential(make_prf_request(UV::Discouraged))
+            .await
+            .err()
+            .unwrap();
+
+        user_interface.assert_last_verification_required();
+        assert!(error.to_string().contains("OperationDenied"));
+        assert!(credential_store.saved_credentials().is_empty());
+    }
+
+    /// UV PRF evaluation returns deterministic first and second outputs.
+    #[tokio::test]
+    async fn test_prf_is_evaluated_with_extension_state() {
+        let client = create_client();
+
+        let cipher = {
+            let mut ctx = client.internal.get_key_store().context();
+            create_test_cipher_with_extension(&mut ctx, Some(extension_state(Some(vec![0x22; 32]))))
+        };
+
+        let user_interface = MockUserInterface::verified();
+        let credential_store = MockCredentialStore::new(cipher);
+        let mut authenticator =
+            Fido2Authenticator::new(&client, &user_interface, &credential_store);
+
+        let first = b"first-input".to_vec();
+        let second = b"second-input".to_vec();
+        let request = prf_request(
+            UV::Preferred,
+            Some(PrfInputValues {
+                first: first.clone(),
+                second: Some(second.clone()),
+                already_hashed: false,
+            }),
+            None,
+        );
+
+        let result = authenticator.get_assertion(request).await.unwrap();
+        assert_eq!(
+            TEST_FIDO_CREDENTIAL_ID,
+            guid_bytes_to_string(&result.credential_id).unwrap()
+        );
+        let output = result.extensions.prf.unwrap().results;
+        assert_eq!(output.first, expected_prf(&[0x11; 32], &first));
+        assert_eq!(output.second, Some(expected_prf(&[0x11; 32], &second)));
+    }
+
+    #[tokio::test]
+    async fn test_prf_already_hashed_input_preserves_apple_wallet_identity() {
+        let client = create_client();
+        let cipher = {
+            let mut ctx = client.internal.get_key_store().context();
+            create_test_cipher_with_extension(&mut ctx, Some(extension_state(Some(vec![0x22; 32]))))
+        };
+        let user_interface = MockUserInterface::verified();
+        let credential_store = MockCredentialStore::new(cipher);
+        let mut authenticator =
+            Fido2Authenticator::new(&client, &user_interface, &credential_store);
+        let raw_input = b"apple-prf-input";
+        let mapped_input = passkey::types::crypto::sha256(
+            &[b"WebAuthn PRF\0".as_slice(), raw_input.as_slice()].concat(),
+        );
+        let request = prf_request(
+            UV::Discouraged,
+            Some(PrfInputValues {
+                first: mapped_input.to_vec(),
+                second: None,
+                already_hashed: true,
+            }),
+            None,
+        );
+
+        let result = authenticator.get_assertion(request).await.unwrap();
+
+        user_interface.assert_last_verification_required();
+        let output = result.extensions.prf.unwrap().results;
+        assert_eq!(output.first, expected_prf(&[0x11; 32], raw_input));
+        assert_eq!(output.second, None);
+    }
+
+    #[tokio::test]
+    async fn test_prf_rejects_invalid_already_hashed_input_before_persistence() {
+        let client = create_client();
+        initialize_user(&client).await;
+        let cipher = {
+            let mut ctx = client.internal.get_key_store().context();
+            create_test_cipher_with_extension_and_counter(
+                &mut ctx,
+                Some(extension_state(Some(vec![0x22; 32]))),
+                "1",
+            )
+        };
+        let user_interface = MockUserInterface::verified();
+        let credential_store = MockCredentialStore::new(cipher);
+        let mut authenticator =
+            Fido2Authenticator::new(&client, &user_interface, &credential_store);
+        let request = prf_request(
+            UV::Required,
+            Some(PrfInputValues {
+                first: vec![0; 31],
+                second: None,
+                already_hashed: true,
+            }),
+            None,
+        );
+
+        let error = authenticator.get_assertion(request).await.err().unwrap();
+
+        assert!(matches!(error, GetAssertionError::InvalidPrfInput(_)));
+        assert!(
+            user_interface
+                .seen_verifications
+                .lock()
+                .expect("Mutex is not poisoned")
+                .is_empty()
+        );
+        assert!(credential_store.saved_credentials().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_native_client_returns_uv_prf_for_raw_and_prehashed_inputs() {
+        let raw_input = b"native-client-prf";
+        let mapped_input = passkey::types::crypto::sha256(
+            &[b"WebAuthn PRF\0".as_slice(), raw_input.as_slice()].concat(),
+        );
+        let expected = expected_prf(&[0x11; 32], raw_input);
+
+        for (extension_name, input) in [
+            ("prf", raw_input.to_vec()),
+            ("prfAlreadyHashed", mapped_input.to_vec()),
+        ] {
+            let client = create_client();
+            initialize_user(&client).await;
+            let cipher = {
+                let mut ctx = client.internal.get_key_store().context();
+                create_test_cipher_with_extension(
+                    &mut ctx,
+                    Some(extension_state(Some(vec![0x22; 32]))),
+                )
+            };
+            let user_interface = MockUserInterface::verified();
+            let credential_store = MockCredentialStore::new(cipher);
+            let authenticator =
+                Fido2Authenticator::new(&client, &user_interface, &credential_store);
+            let mut native_client = Fido2Client { authenticator };
+
+            let result = native_client
+                .authenticate(
+                    Origin::Web("https://example.com".to_string()),
+                    native_prf_request(extension_name, B64Url::from(input).to_string()),
+                    ClientData::DefaultWithCustomHash { hash: vec![0; 32] },
+                )
+                .await
+                .unwrap();
+
+            user_interface.assert_last_verification_required();
+            let output = result
+                .client_extension_results
+                .prf
+                .expect("native response must include PRF extension output")
+                .results
+                .expect("native response must include evaluated PRF values");
+            assert_eq!(output.first, expected, "extension path: {extension_name}");
+            assert_eq!(output.second, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_native_client_prf_failure_does_not_update_counter_or_persist() {
+        let client = create_client();
+        initialize_user(&client).await;
+        let cipher = {
+            let mut ctx = client.internal.get_key_store().context();
+            create_test_cipher_with_extension_and_counter(
+                &mut ctx,
+                Some(extension_state(Some(vec![0x22; 32]))),
+                "1",
+            )
+        };
+        let user_interface = MockUserInterface::unverified();
+        let credential_store = MockCredentialStore::new(cipher);
+        let authenticator = Fido2Authenticator::new(&client, &user_interface, &credential_store);
+        let mut native_client = Fido2Client { authenticator };
+
+        let result = native_client
+            .authenticate(
+                Origin::Web("https://example.com".to_string()),
+                native_prf_request(
+                    "prf",
+                    B64Url::from(b"must-not-evaluate".to_vec()).to_string(),
+                ),
+                ClientData::DefaultWithCustomHash { hash: vec![0; 32] },
+            )
+            .await;
+
+        assert!(result.is_err());
+        user_interface.assert_last_verification_required();
+        assert!(credential_store.saved_credentials().is_empty());
+    }
+
+    /// A credential-specific input for another credential produces no PRF output.
+    #[tokio::test]
+    async fn test_prf_eval_by_credential_mismatch_produces_no_output() {
+        let client = create_client();
+        let cipher = {
+            let mut ctx = client.internal.get_key_store().context();
+            create_test_cipher_with_extension(&mut ctx, Some(extension_state(Some(vec![0x22; 32]))))
+        };
+
+        let user_interface = MockUserInterface::verified();
+        let credential_store = MockCredentialStore::new(cipher);
+        let mut authenticator =
+            Fido2Authenticator::new(&client, &user_interface, &credential_store);
+
+        let request = prf_request(
+            UV::Preferred,
+            None,
+            Some(HashMap::from([(
+                vec![0x99; 16],
+                PrfInputValues {
+                    first: b"not-selected".to_vec(),
+                    second: None,
+                    already_hashed: false,
+                },
+            )])),
+        );
+
+        let result = authenticator.get_assertion(request).await.unwrap();
+        assert_eq!(
+            TEST_FIDO_CREDENTIAL_ID,
+            guid_bytes_to_string(&result.credential_id).unwrap()
+        );
+        assert!(
+            result.extensions.prf.is_none(),
+            "PRF should not be evaluated for a non-matching credential ID"
+        );
+    }
+
+    /// PRF is evaluated with only the UV seed (non-UV seed is None).
+    /// This covers credentials created with UV-only HMAC secret config.
+    #[tokio::test]
+    async fn test_prf_is_evaluated_with_uv_only_seed() {
+        let client = create_client();
+        let cipher = {
+            let mut ctx = client.internal.get_key_store().context();
+            create_test_cipher_with_extension(&mut ctx, Some(extension_state(None)))
+        };
+
+        let user_interface = MockUserInterface::verified();
+        let credential_store = MockCredentialStore::new(cipher);
+        let mut authenticator =
+            Fido2Authenticator::new(&client, &user_interface, &credential_store);
+
+        let first = b"uv-only".to_vec();
+        let request = prf_request(
+            UV::Preferred,
+            Some(PrfInputValues {
+                first: first.clone(),
+                second: None,
+                already_hashed: false,
+            }),
+            None,
+        );
+
+        let result = authenticator.get_assertion(request).await.unwrap();
+        assert_eq!(
+            TEST_FIDO_CREDENTIAL_ID,
+            guid_bytes_to_string(&result.credential_id).unwrap()
+        );
+        let output = result.extensions.prf.unwrap().results;
+        assert_eq!(output.first, expected_prf(&[0x11; 32], &first));
+        assert_eq!(output.second, None);
+    }
+
+    /// PRF requested but credential has no extension_state → fail closed with PrfMissingSeedState.
+    #[tokio::test]
+    async fn test_prf_fails_closed_when_no_seed_state() {
+        let client = create_client();
+        initialize_user(&client).await;
+
+        let cipher = {
+            let mut ctx = client.internal.get_key_store().context();
+            create_test_cipher_with_extension_and_counter(&mut ctx, None, "1")
+        };
+
+        let user_interface = MockUserInterface::verified();
+        let credential_store = MockCredentialStore::new(cipher);
+        let mut authenticator =
+            Fido2Authenticator::new(&client, &user_interface, &credential_store);
+
+        let request = prf_request(
+            UV::Preferred,
+            Some(PrfInputValues {
+                first: b"missing-state".to_vec(),
+                second: None,
+                already_hashed: false,
+            }),
+            None,
+        );
+
+        let error = authenticator.get_assertion(request).await.err().unwrap();
+        assert!(matches!(error, GetAssertionError::PrfMissingSeedState));
+        assert!(
+            credential_store.saved_credentials().is_empty(),
+            "PRF prevalidation must fail before the signature counter is persisted"
+        );
+    }
+
+    /// PRF NOT requested → no PRF output returned, even with extension_state present.
+    #[tokio::test]
+    async fn test_no_prf_output_when_not_requested() {
+        let client = Client::new(None);
+        let user_key: SymmetricCryptoKey =
+            "w2LO+nwV4oxwswVYCxlOfRUseXfvU03VzvKQHrqeklPgiMZrspUe6sOBToCnDn9Ay0tuCBn8ykVVRb7PWhub2Q=="
+                .to_string()
+                .try_into()
+                .unwrap();
+
+        #[allow(deprecated)]
+        client
+            .internal
+            .get_key_store()
+            .context_mut()
+            .set_symmetric_key(SymmetricKeySlotId::User, user_key)
+            .unwrap();
+
+        let uv_seed = B64Url::from(vec![0x11u8; 32]).to_string();
+        let non_uv_seed = B64Url::from(vec![0x22u8; 32]).to_string();
+        let extension_state = Fido2ExtensionStateView {
+            prf_hmac_algorithm: "hmac-secret".to_string(),
+            uv_hmac_seed: uv_seed,
+            non_uv_hmac_seed: Some(non_uv_seed),
+            cred_blob: None,
+            large_blob: None,
+            key_algorithm_metadata: "ES256".to_string(),
+        };
+
+        let cipher = {
+            let mut ctx = client.internal.get_key_store().context();
+            create_test_cipher_with_extension(&mut ctx, Some(extension_state))
+        };
+
+        let user_interface = MockUserInterface::verified();
+        let credential_store = MockCredentialStore::new(cipher);
+        let mut authenticator =
+            Fido2Authenticator::new(&client, &user_interface, &credential_store);
+
+        // No PRF extension requested
+        let request = GetAssertionRequest {
+            rp_id: "example.com".to_string(),
+            client_data_hash: vec![0u8; 32],
+            allow_list: None,
+            options: Options {
+                rk: false,
+                uv: UV::Preferred,
+            },
+            extensions: None,
+        };
+
+        let result = authenticator.get_assertion(request).await.unwrap();
+        assert_eq!(
+            TEST_FIDO_CREDENTIAL_ID,
+            guid_bytes_to_string(&result.credential_id).unwrap()
+        );
+        assert!(
+            result.extensions.prf.is_none(),
+            "PRF output should not be present when PRF was not requested"
+        );
+    }
+
+    /// PRF requested with extensions but prf field is None → no PRF output, no failure.
+    #[tokio::test]
+    async fn test_no_prf_output_when_prf_field_is_none() {
         let client = Client::new(None);
         let user_key: SymmetricCryptoKey =
             "w2LO+nwV4oxwswVYCxlOfRUseXfvU03VzvKQHrqeklPgiMZrspUe6sOBToCnDn9Ay0tuCBn8ykVVRb7PWhub2Q=="
@@ -878,11 +1697,12 @@ mod tests {
             create_test_cipher(&mut ctx)
         };
 
-        let user_interface = MockUserInterface;
-        let credential_store = MockCredentialStore { cipher };
+        let user_interface = MockUserInterface::verified();
+        let credential_store = MockCredentialStore::new(cipher);
         let mut authenticator =
             Fido2Authenticator::new(&client, &user_interface, &credential_store);
 
+        // Extensions present but prf is None
         let request = GetAssertionRequest {
             rp_id: "example.com".to_string(),
             client_data_hash: vec![0u8; 32],
@@ -891,25 +1711,207 @@ mod tests {
                 rk: false,
                 uv: UV::Preferred,
             },
-            extensions: Some(GetAssertionExtensionsInput {
-                prf: Some(GetAssertionPrfInput {
-                    eval: Some(PrfInputValues {
-                        first: vec![1u8; 32],
-                        second: None,
-                    }),
-                    eval_by_credential: None,
-                }),
-            }),
+            extensions: Some(GetAssertionExtensionsInput { prf: None }),
         };
 
         let result = authenticator.get_assertion(request).await.unwrap();
-        assert_eq!(
-            TEST_FIDO_CREDENTIAL_ID,
-            guid_bytes_to_string(&result.credential_id).unwrap()
-        );
         assert!(
             result.extensions.prf.is_none(),
-            "PRF should not be evaluated"
+            "PRF output should not be present when prf field is None"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prf_eval_by_credential_uses_selected_credential_input() {
+        let client = create_client();
+        let cipher = {
+            let mut ctx = client.internal.get_key_store().context();
+            create_test_cipher_with_extension(&mut ctx, Some(extension_state(Some(vec![0x22; 32]))))
+        };
+        let user_interface = MockUserInterface::verified();
+        let credential_store = MockCredentialStore::new(cipher);
+        let mut authenticator =
+            Fido2Authenticator::new(&client, &user_interface, &credential_store);
+
+        let selected_input = b"credential-specific".to_vec();
+        let request = prf_request(
+            UV::Discouraged,
+            Some(PrfInputValues {
+                first: b"fallback".to_vec(),
+                second: None,
+                already_hashed: false,
+            }),
+            Some(HashMap::from([(
+                string_to_guid_bytes(TEST_FIDO_CREDENTIAL_ID).unwrap(),
+                PrfInputValues {
+                    first: selected_input.clone(),
+                    second: None,
+                    already_hashed: false,
+                },
+            )])),
+        );
+
+        let result = authenticator.get_assertion(request).await.unwrap();
+        user_interface.assert_last_verification_required();
+        let output = result.extensions.prf.unwrap().results;
+        assert_eq!(output.first, expected_prf(&[0x11; 32], &selected_input));
+        assert_eq!(output.second, None);
+    }
+
+    #[tokio::test]
+    async fn test_prf_discouraged_request_is_overridden_to_uv() {
+        let client = create_client();
+        let cipher = {
+            let mut ctx = client.internal.get_key_store().context();
+            create_test_cipher_with_extension(&mut ctx, Some(extension_state(Some(vec![0x22; 32]))))
+        };
+        let user_interface = MockUserInterface::verified();
+        let credential_store = MockCredentialStore::new(cipher);
+        let mut authenticator =
+            Fido2Authenticator::new(&client, &user_interface, &credential_store);
+
+        let first = b"forced-uv".to_vec();
+        let request = prf_request(
+            UV::Discouraged,
+            Some(PrfInputValues {
+                first: first.clone(),
+                second: None,
+                already_hashed: false,
+            }),
+            None,
+        );
+
+        let result = authenticator.get_assertion(request).await.unwrap();
+        user_interface.assert_last_verification_required();
+        let output = result.extensions.prf.unwrap().results;
+        assert_eq!(output.first, expected_prf(&[0x11; 32], &first));
+        assert_eq!(output.second, None);
+        assert_ne!(
+            result.authenticator_data[32] & 0x04,
+            0,
+            "UV flag must be set"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prf_discouraged_request_fails_without_uv_before_persistence() {
+        let client = create_client();
+        initialize_user(&client).await;
+        let cipher = {
+            let mut ctx = client.internal.get_key_store().context();
+            create_test_cipher_with_extension_and_counter(
+                &mut ctx,
+                Some(extension_state(Some(vec![0x22; 32]))),
+                "1",
+            )
+        };
+        let user_interface = MockUserInterface::unverified();
+        let credential_store = MockCredentialStore::new(cipher);
+        let mut authenticator =
+            Fido2Authenticator::new(&client, &user_interface, &credential_store);
+        let request = prf_request(
+            UV::Discouraged,
+            Some(PrfInputValues {
+                first: b"uv-must-succeed".to_vec(),
+                second: None,
+                already_hashed: false,
+            }),
+            None,
+        );
+
+        let error = authenticator.get_assertion(request).await.err().unwrap();
+        user_interface.assert_last_verification_required();
+        assert!(
+            matches!(error, GetAssertionError::Other(message) if message.contains("OperationDenied"))
+        );
+        assert!(credential_store.saved_credentials().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_prf_invalid_seed_fails_before_persistence() {
+        let client = create_client();
+        initialize_user(&client).await;
+        let mut invalid_state = extension_state(Some(vec![0x22; 32]));
+        invalid_state.uv_hmac_seed = B64Url::from(vec![0x11; 31]).to_string();
+        let cipher = {
+            let mut ctx = client.internal.get_key_store().context();
+            create_test_cipher_with_extension_and_counter(&mut ctx, Some(invalid_state), "1")
+        };
+        let user_interface = MockUserInterface::verified();
+        let credential_store = MockCredentialStore::new(cipher);
+        let mut authenticator =
+            Fido2Authenticator::new(&client, &user_interface, &credential_store);
+        let request = prf_request(
+            UV::Preferred,
+            Some(PrfInputValues {
+                first: b"invalid-seed".to_vec(),
+                second: None,
+                already_hashed: false,
+            }),
+            None,
+        );
+
+        let error = authenticator.get_assertion(request).await.err().unwrap();
+        assert!(matches!(error, GetAssertionError::PrfInvalidSeedState));
+        assert!(credential_store.saved_credentials().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_counter_update_preserves_opaque_extension_state() {
+        let client = create_client();
+        initialize_user(&client).await;
+        let portable_credential_id = format!("b64.{}", B64Url::from(vec![0xa5; 32]));
+        let mut original_state = extension_state(Some(vec![0x22; 32]));
+        original_state.cred_blob = Some("opaque-cred-blob".to_string());
+        original_state.large_blob = Some("opaque-large-blob".to_string());
+        original_state.key_algorithm_metadata = "opaque-key-metadata".to_string();
+        let cipher = {
+            let mut ctx = client.internal.get_key_store().context();
+            let mut cipher = create_test_cipher_with_extension_and_counter(
+                &mut ctx,
+                Some(original_state.clone()),
+                "1",
+            );
+            cipher
+                .login
+                .as_mut()
+                .unwrap()
+                .fido2_credentials
+                .as_mut()
+                .unwrap()[0]
+                .credential_id = portable_credential_id
+                .encrypt(&mut ctx, SymmetricKeySlotId::User)
+                .unwrap();
+            cipher
+        };
+        let user_interface = MockUserInterface::verified();
+        let credential_store = MockCredentialStore::new(cipher);
+        let mut authenticator =
+            Fido2Authenticator::new(&client, &user_interface, &credential_store);
+        let request = prf_request(
+            UV::Preferred,
+            Some(PrfInputValues {
+                first: b"persist-only-counter".to_vec(),
+                second: None,
+                already_hashed: false,
+            }),
+            None,
+        );
+
+        authenticator.get_assertion(request).await.unwrap();
+
+        let saved = credential_store.saved_credentials();
+        assert_eq!(saved.len(), 1);
+        let key_store = client.internal.get_key_store();
+        let saved_view: CipherView = key_store.decrypt(&saved[0].cipher).unwrap();
+        let saved_credentials = saved_view
+            .get_fido2_credentials(&mut key_store.context())
+            .unwrap();
+        assert_eq!(saved_credentials[0].credential_id, portable_credential_id);
+        assert_eq!(saved_credentials[0].counter, "2");
+        assert_eq!(
+            saved_credentials[0].extension_state.as_ref(),
+            Some(&original_state)
         );
     }
 }

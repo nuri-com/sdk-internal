@@ -5,13 +5,16 @@
 
 use bitwarden_core::MissingFieldError;
 use bitwarden_fido::{InvalidGuidError, string_to_guid_bytes};
-use bitwarden_vault::{FieldType, Totp, TotpAlgorithm};
+use bitwarden_vault::{Fido2ExtensionStateView, FieldType, Totp, TotpAlgorithm};
 use chrono::{DateTime, Utc};
 use credential_exchange_format::{
-    AndroidAppIdCredential, B64Url, BasicAuthCredential, CredentialScope, NotB64UrlEncoded,
-    OTPHashAlgorithm, PasskeyCredential, TotpCredential,
+    AndroidAppIdCredential, B64Url, BasicAuthCredential, CredentialScope, Fido2Extensions,
+    Fido2HmacCredentialAlgorithm, NotB64UrlEncoded, OTPHashAlgorithm, PasskeyCredential,
+    TotpCredential,
 };
+use p256::{SecretKey, pkcs8::DecodePrivateKey};
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 use crate::{Fido2Credential, Field, Login, LoginUri};
 
@@ -48,13 +51,122 @@ fn totp_credential_to_totp(cxf_totp: &TotpCredential) -> Totp {
     }
 }
 
+/// Errors that can occur while importing CXF passkey data.
+#[derive(Debug, Error)]
+pub(crate) enum PasskeyImportError {
+    /// CXF requires PKCS#8 DER. The P-256 decoder also rejects keys on unsupported curves.
+    #[error("Passkey key is not a valid PKCS#8 P-256 private key")]
+    InvalidPkcs8P256Key,
+
+    #[error("Unsupported FIDO2 HMAC credential algorithm: {0}")]
+    UnsupportedHmacAlgorithm(String),
+
+    #[error("Invalid {seed_name} HMAC seed length: expected 32 bytes, got {actual}")]
+    InvalidHmacSeedLength {
+        seed_name: &'static str,
+        actual: usize,
+    },
+
+    #[error("Secure-payment-confirmation extension import is not supported")]
+    UnsupportedPaymentsExtension,
+
+    #[error("credBlob/largeBlob import without HMAC credentials is not supported")]
+    ExtensionStateWithoutHmacCredentials,
+
+    #[error("Unable to serialize FIDO2 extension state: {0}")]
+    SerializeExtensionState(#[from] serde_json::Error),
+}
+
+/// Result of deriving the passkey key algorithm and curve from a CXF passkey credential.
+///
+/// Bitwarden stores the key algorithm and curve as free-form strings on the encrypted
+/// [`Fido2Credential`] model (e.g. `"ECDSA"` and `"P-256"`). CXF stores the private key as
+/// base64url-encoded PKCS#8 DER. The MVP deliberately accepts only P-256/ES256.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DerivedKeyAlgorithm {
+    /// Bitwarden `key_algorithm` string, e.g. `"ECDSA"`.
+    pub key_algorithm: String,
+    /// Bitwarden `key_curve` string, e.g. `"P-256"`.
+    pub key_curve: String,
+}
+
+pub(crate) fn derive_key_algorithm(
+    passkey: &PasskeyCredential,
+) -> Result<DerivedKeyAlgorithm, PasskeyImportError> {
+    SecretKey::from_pkcs8_der(passkey.key.as_ref())
+        .map_err(|_| PasskeyImportError::InvalidPkcs8P256Key)?;
+
+    Ok(DerivedKeyAlgorithm {
+        key_algorithm: "ECDSA".to_string(),
+        key_curve: "P-256".to_string(),
+    })
+}
+
+/// Build the JSON-serialized extension state string from CXF FIDO2 extensions.
+///
+/// Returns `None` when the CXF passkey does not carry HMAC/PRF seed state. Present extension
+/// values are validated and preserved; unsupported or malformed values fail the whole import.
+fn extensions_to_state_json(
+    extensions: Option<&Fido2Extensions>,
+    key_algorithm_metadata: &str,
+) -> Result<Option<String>, PasskeyImportError> {
+    let Some(ext) = extensions else {
+        return Ok(None);
+    };
+    if matches!(ext.payments, Some(true)) {
+        return Err(PasskeyImportError::UnsupportedPaymentsExtension);
+    }
+    let Some(hmac) = ext.hmac_credentials.as_ref() else {
+        return if ext.cred_blob.is_some() || ext.large_blob.is_some() {
+            Err(PasskeyImportError::ExtensionStateWithoutHmacCredentials)
+        } else {
+            Ok(None)
+        };
+    };
+
+    match &hmac.algorithm {
+        Fido2HmacCredentialAlgorithm::HmacSha256 => {}
+        Fido2HmacCredentialAlgorithm::Other(value) => {
+            return Err(PasskeyImportError::UnsupportedHmacAlgorithm(value.clone()));
+        }
+    }
+    validate_seed("credWithUV", hmac.cred_with_uv.as_ref())?;
+    validate_seed("credWithoutUV", hmac.cred_without_uv.as_ref())?;
+
+    let state = Zeroizing::new(Fido2ExtensionStateView {
+        // This is Bitwarden's established name for the CTAP hmac-secret/PRF capability.
+        prf_hmac_algorithm: "hmac-secret".to_string(),
+        uv_hmac_seed: hmac.cred_with_uv.to_string(),
+        non_uv_hmac_seed: Some(hmac.cred_without_uv.to_string()),
+        cred_blob: ext.cred_blob.as_ref().map(ToString::to_string),
+        large_blob: ext
+            .large_blob
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?,
+        key_algorithm_metadata: key_algorithm_metadata.to_string(),
+    });
+    Ok(Some(serde_json::to_string(&*state)?))
+}
+
+fn validate_seed(seed_name: &'static str, seed: &[u8]) -> Result<(), PasskeyImportError> {
+    const HMAC_SHA256_SEED_LENGTH: usize = 32;
+    if seed.len() != HMAC_SHA256_SEED_LENGTH {
+        return Err(PasskeyImportError::InvalidHmacSeedLength {
+            seed_name,
+            actual: seed.len(),
+        });
+    }
+    Ok(())
+}
+
 pub(super) fn to_login(
     creation_date: DateTime<Utc>,
     basic_auth: Option<&BasicAuthCredential>,
     passkey: Option<&PasskeyCredential>,
     totp: Option<&TotpCredential>,
     scope: Option<&CredentialScope>,
-) -> Login {
+) -> Result<Login, PasskeyImportError> {
     // Use basic_auth username first, fallback to non-empty passkey username
     let username = basic_auth
         .and_then(|v| v.username.clone().map(Into::into))
@@ -70,29 +182,40 @@ pub(super) fn to_login(
         .or_else(|| passkey.map(|p| vec![passkey_rp_id_to_uri(&p.rp_id)]))
         .unwrap_or_default();
 
-    Login {
+    let derived = passkey.map(derive_key_algorithm).transpose()?;
+    let (key_algorithm, key_curve) = derived
+        .map(|value| (value.key_algorithm, value.key_curve))
+        .unwrap_or(("ECDSA".to_string(), "P-256".to_string()));
+
+    let fido2_credentials = if let Some(p) = passkey {
+        let extension_state = extensions_to_state_json(p.fido2_extensions.as_ref(), "ES256")?;
+        Some(vec![Fido2Credential {
+            credential_id: format!("b64.{}", p.credential_id),
+            key_type: "public-key".to_string(),
+            key_algorithm,
+            key_curve,
+            key_value: p.key.to_string(),
+            rp_id: p.rp_id.clone(),
+            user_handle: Some(p.user_handle.to_string()),
+            user_name: Some(p.username.clone()),
+            counter: 0,
+            rp_name: Some(p.rp_id.clone()),
+            user_display_name: Some(p.user_display_name.clone()),
+            discoverable: "true".to_string(),
+            creation_date,
+            extension_state,
+        }])
+    } else {
+        None
+    };
+
+    Ok(Login {
         username,
         password: basic_auth.and_then(|v| v.password.clone().map(|u| u.into())),
         login_uris,
         totp: totp.map(|t| totp_credential_to_totp(t).to_string()),
-        fido2_credentials: passkey.map(|p| {
-            vec![Fido2Credential {
-                credential_id: format!("b64.{}", p.credential_id),
-                key_type: "public-key".to_string(),
-                key_algorithm: "ECDSA".to_string(),
-                key_curve: "P-256".to_string(),
-                key_value: p.key.to_string(),
-                rp_id: p.rp_id.clone(),
-                user_handle: Some(p.user_handle.to_string()),
-                user_name: Some(p.username.clone()),
-                counter: 0,
-                rp_name: Some(p.rp_id.clone()),
-                user_display_name: Some(p.user_display_name.clone()),
-                discoverable: "true".to_string(),
-                creation_date,
-            }]
-        }),
-    }
+        fido2_credentials,
+    })
 }
 
 /// Creates a LoginUri from a URL string
@@ -216,6 +339,8 @@ impl TryFrom<Fido2Credential> for PasskeyCredential {
                 .map_err(PasskeyError::InvalidBase64)?
                 .ok_or(PasskeyError::MissingField(MissingFieldError("user_handle")))?,
             key: B64Url::try_from(value.key_value.as_str()).map_err(PasskeyError::InvalidBase64)?,
+            // Exporting portable HMAC seeds is intentionally deferred to the separately reviewed
+            // CXF export work. Import support must not make secrets exportable by accident.
             fido2_extensions: None,
         })
     }
@@ -223,8 +348,13 @@ impl TryFrom<Fido2Credential> for PasskeyCredential {
 
 #[cfg(test)]
 mod tests {
+    use credential_exchange_format::{Fido2HmacCredentials, Fido2LargeBlob};
+
     use super::*;
     use crate::LoginUri;
+
+    /// Known-good base64url-encoded PKCS#8 DER for an ES256/P-256 private key.
+    const TEST_ES256_PKCS8_KEY_B64URL: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgPzvtWYWmIsvqqr3LsZB0K-cbjuhJSGTGziL1LksHAPShRANCAAT-vqHTyEDS9QBNNi2BNLyu6TunubJT_L3G3i7KLpEDhMD15hi24IjGBH0QylJIrvlT4JN2tdRGF436XGc-VoAl";
 
     #[test]
     fn test_basic_auth() {
@@ -284,6 +414,7 @@ mod tests {
             user_display_name: None,
             discoverable: "true".to_string(),
             creation_date: "2024-06-07T14:12:36.150Z".parse().unwrap(),
+            extension_state: None,
         };
 
         let passkey: PasskeyCredential = credential.try_into().unwrap();
@@ -659,5 +790,293 @@ mod tests {
         let uri = create_login_uri("https://test.example".to_string());
         assert_eq!(uri.uri, Some("https://test.example".to_string()));
         assert_eq!(uri.r#match, None);
+    }
+
+    // --- Passkey key algorithm derivation tests ---
+
+    /// Build a `PasskeyCredential` with a given base64url-encoded PKCS#8 key.
+    fn build_passkey_with_key(key_b64url: &str) -> PasskeyCredential {
+        PasskeyCredential {
+            credential_id: B64Url::try_from("6NiHiekW4ZY8vYHa-ucbvA").unwrap(),
+            rp_id: "example.com".to_string(),
+            username: "test".to_string(),
+            user_display_name: "Test User".to_string(),
+            user_handle: B64Url::try_from("YWxleCBtdWxsZXI").unwrap(),
+            key: B64Url::try_from(key_b64url).unwrap(),
+            fido2_extensions: None,
+        }
+    }
+
+    #[test]
+    fn test_derive_key_algorithm_es256() {
+        let passkey = build_passkey_with_key(TEST_ES256_PKCS8_KEY_B64URL);
+        let derived = derive_key_algorithm(&passkey).expect("ES256 key should derive");
+        assert_eq!(derived.key_algorithm, "ECDSA");
+        assert_eq!(derived.key_curve, "P-256");
+    }
+
+    #[test]
+    fn test_derive_key_algorithm_rejects_invalid_pkcs8() {
+        let passkey = build_passkey_with_key("aGVsbG8");
+        let err = derive_key_algorithm(&passkey).unwrap_err();
+        assert!(
+            matches!(err, PasskeyImportError::InvalidPkcs8P256Key),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_to_login_fails_closed_on_invalid_pkcs8() {
+        let passkey = build_passkey_with_key("aGVsbG8");
+        let err = to_login(
+            "2024-06-07T14:12:36.150Z".parse().unwrap(),
+            None,
+            Some(&passkey),
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, PasskeyImportError::InvalidPkcs8P256Key),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_to_login_passkey_derives_algorithm_from_pkcs8() {
+        let passkey = build_passkey_with_key(TEST_ES256_PKCS8_KEY_B64URL);
+
+        let login = to_login(
+            "2024-06-07T14:12:36.150Z".parse().unwrap(),
+            None,
+            Some(&passkey),
+            None,
+            None,
+        )
+        .unwrap();
+
+        let creds = login.fido2_credentials.expect("passkey present");
+        assert_eq!(creds.len(), 1);
+        let cred = &creds[0];
+        assert_eq!(cred.key_algorithm, "ECDSA");
+        assert_eq!(cred.key_curve, "P-256");
+        assert_eq!(cred.key_type, "public-key");
+    }
+
+    // --- FIDO2 extension state preservation tests ---
+
+    fn valid_extensions() -> Fido2Extensions {
+        Fido2Extensions {
+            hmac_credentials: Some(Fido2HmacCredentials {
+                algorithm: Fido2HmacCredentialAlgorithm::HmacSha256,
+                cred_with_uv: B64Url::from(vec![0x11; 32]),
+                cred_without_uv: B64Url::from(vec![0x22; 32]),
+            }),
+            cred_blob: Some(B64Url::from(b"credential-blob".as_slice())),
+            large_blob: Some(Fido2LargeBlob {
+                uncompressed_size: 4,
+                data: B64Url::from(b"blob".as_slice()),
+            }),
+            payments: None,
+        }
+    }
+
+    fn build_passkey_with_extensions(extensions: Fido2Extensions) -> PasskeyCredential {
+        let mut passkey = build_passkey_with_key(TEST_ES256_PKCS8_KEY_B64URL);
+        passkey.rp_id = "nuri.com".to_string();
+        passkey.fido2_extensions = Some(extensions);
+        passkey
+    }
+
+    #[test]
+    fn test_to_login_preserves_extension_state() {
+        let extensions = valid_extensions();
+        let expected_large_blob = serde_json::to_string(&extensions.large_blob).unwrap();
+        let expected_uv = B64Url::from(vec![0x11; 32]).to_string();
+        let expected_non_uv = B64Url::from(vec![0x22; 32]).to_string();
+        let expected_cred_blob = B64Url::from(b"credential-blob".as_slice()).to_string();
+        let passkey = build_passkey_with_extensions(extensions);
+
+        let login = to_login(
+            "2024-06-07T14:12:36.150Z".parse().unwrap(),
+            None,
+            Some(&passkey),
+            None,
+            None,
+        )
+        .unwrap();
+
+        let creds = login.fido2_credentials.expect("passkey present");
+        assert_eq!(creds.len(), 1);
+        let cred = &creds[0];
+
+        let state_json = cred
+            .extension_state
+            .as_ref()
+            .expect("extension_state present");
+        let state: Fido2ExtensionStateView = serde_json::from_str(state_json).unwrap();
+
+        assert_eq!(state.prf_hmac_algorithm, "hmac-secret");
+        assert_eq!(state.uv_hmac_seed, expected_uv);
+        assert_eq!(
+            state.non_uv_hmac_seed.as_deref(),
+            Some(expected_non_uv.as_str())
+        );
+        assert_eq!(
+            state.cred_blob.as_deref(),
+            Some(expected_cred_blob.as_str())
+        );
+        assert_eq!(state.large_blob, Some(expected_large_blob));
+        assert_eq!(state.key_algorithm_metadata, "ES256");
+    }
+
+    #[test]
+    fn test_to_login_rejects_unknown_hmac_algorithm() {
+        let mut extensions = valid_extensions();
+        extensions.hmac_credentials.as_mut().unwrap().algorithm =
+            Fido2HmacCredentialAlgorithm::Other("sha512".to_string());
+        let passkey = build_passkey_with_extensions(extensions);
+
+        let error = to_login(Utc::now(), None, Some(&passkey), None, None).unwrap_err();
+        assert!(matches!(
+            error,
+            PasskeyImportError::UnsupportedHmacAlgorithm(value) if value == "sha512"
+        ));
+    }
+
+    #[test]
+    fn test_to_login_rejects_wrong_seed_length() {
+        let mut extensions = valid_extensions();
+        extensions.hmac_credentials.as_mut().unwrap().cred_with_uv = B64Url::from(vec![0x11; 31]);
+        let passkey = build_passkey_with_extensions(extensions);
+
+        let error = to_login(Utc::now(), None, Some(&passkey), None, None).unwrap_err();
+        assert!(matches!(
+            error,
+            PasskeyImportError::InvalidHmacSeedLength {
+                seed_name: "credWithUV",
+                actual: 31
+            }
+        ));
+
+        let mut extensions = valid_extensions();
+        extensions
+            .hmac_credentials
+            .as_mut()
+            .unwrap()
+            .cred_without_uv = B64Url::from(vec![0x22; 33]);
+        let passkey = build_passkey_with_extensions(extensions);
+        let error = to_login(Utc::now(), None, Some(&passkey), None, None).unwrap_err();
+        assert!(matches!(
+            error,
+            PasskeyImportError::InvalidHmacSeedLength {
+                seed_name: "credWithoutUV",
+                actual: 33
+            }
+        ));
+    }
+
+    #[test]
+    fn test_to_login_rejects_payments_extension() {
+        let mut extensions = valid_extensions();
+        extensions.payments = Some(true);
+        let passkey = build_passkey_with_extensions(extensions);
+
+        let error = to_login(Utc::now(), None, Some(&passkey), None, None).unwrap_err();
+        assert!(matches!(
+            error,
+            PasskeyImportError::UnsupportedPaymentsExtension
+        ));
+    }
+
+    #[test]
+    fn test_to_login_accepts_explicit_false_payments_with_hmac_state() {
+        let mut extensions = valid_extensions();
+        extensions.payments = Some(false);
+        let passkey = build_passkey_with_extensions(extensions);
+
+        let login = to_login(Utc::now(), None, Some(&passkey), None, None).unwrap();
+        let credential = &login.fido2_credentials.unwrap()[0];
+        let state: Fido2ExtensionStateView =
+            serde_json::from_str(credential.extension_state.as_ref().unwrap()).unwrap();
+
+        assert_eq!(state.uv_hmac_seed, B64Url::from(vec![0x11; 32]).to_string());
+        assert_eq!(
+            state.non_uv_hmac_seed,
+            Some(B64Url::from(vec![0x22; 32]).to_string())
+        );
+    }
+
+    #[test]
+    fn test_to_login_treats_explicit_false_payments_without_hmac_as_no_state() {
+        let passkey = build_passkey_with_extensions(Fido2Extensions {
+            payments: Some(false),
+            ..Default::default()
+        });
+
+        let login = to_login(Utc::now(), None, Some(&passkey), None, None).unwrap();
+        assert!(
+            login.fido2_credentials.unwrap()[0]
+                .extension_state
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_to_login_rejects_unrepresentable_extension_state() {
+        let extensions = Fido2Extensions {
+            cred_blob: Some(B64Url::from(b"credential-blob".as_slice())),
+            ..Default::default()
+        };
+        let passkey = build_passkey_with_extensions(extensions);
+
+        let error = to_login(Utc::now(), None, Some(&passkey), None, None).unwrap_err();
+        assert!(matches!(
+            error,
+            PasskeyImportError::ExtensionStateWithoutHmacCredentials
+        ));
+    }
+
+    #[test]
+    fn test_to_login_without_extensions_has_no_extension_state() {
+        let passkey = build_passkey_with_key(TEST_ES256_PKCS8_KEY_B64URL);
+
+        let login = to_login(
+            "2024-06-07T14:12:36.150Z".parse().unwrap(),
+            None,
+            Some(&passkey),
+            None,
+            None,
+        )
+        .unwrap();
+
+        let creds = login.fido2_credentials.expect("passkey present");
+        assert_eq!(creds.len(), 1);
+        let cred = &creds[0];
+        assert!(
+            cred.extension_state.is_none(),
+            "extension_state should be None when fido2_extensions is None"
+        );
+    }
+
+    #[test]
+    fn test_cxf_export_does_not_publish_extension_seeds_yet() {
+        let passkey = build_passkey_with_extensions(valid_extensions());
+
+        let login = to_login(
+            "2024-06-07T14:12:36.150Z".parse().unwrap(),
+            None,
+            Some(&passkey),
+            None,
+            None,
+        )
+        .unwrap();
+
+        let cred = login.fido2_credentials.unwrap().into_iter().next().unwrap();
+
+        // Export: Fido2Credential -> CXF PasskeyCredential
+        let exported: PasskeyCredential = cred.try_into().unwrap();
+
+        assert!(exported.fido2_extensions.is_none());
     }
 }

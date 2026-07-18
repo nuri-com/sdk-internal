@@ -145,6 +145,9 @@ impl From<Fido2CredentialFullView> for crate::Fido2Credential {
             user_display_name: value.user_display_name,
             discoverable: value.discoverable,
             creation_date: value.creation_date,
+            extension_state: value
+                .extension_state
+                .and_then(|s| serde_json::to_string(&s).ok()),
         }
     }
 }

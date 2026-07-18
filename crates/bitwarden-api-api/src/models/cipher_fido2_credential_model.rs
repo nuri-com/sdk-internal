@@ -88,6 +88,14 @@ pub struct CipherFido2CredentialModel {
     pub discoverable: Option<String>,
     #[serde(rename = "creationDate", alias = "CreationDate")]
     pub creation_date: String,
+    /// Optional encrypted FIDO2 extension state (opaque encrypted string).
+    /// Carries PRF/HMAC seed state, blobs, and key metadata for portable passkeys.
+    #[serde(
+        rename = "extensionState",
+        alias = "ExtensionState",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub extension_state: Option<String>,
 }
 
 impl CipherFido2CredentialModel {
@@ -106,6 +114,7 @@ impl CipherFido2CredentialModel {
             counter: None,
             discoverable: None,
             creation_date,
+            extension_state: None,
         }
     }
 }

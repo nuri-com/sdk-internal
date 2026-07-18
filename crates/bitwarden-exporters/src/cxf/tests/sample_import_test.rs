@@ -14,11 +14,12 @@ fn parse_cxf_spec(payload: String) -> Result<Vec<ImportingCipher>, CxfError> {
 
     let header: Header = serde_json::from_str(&payload)?;
 
-    let items: Vec<ImportingCipher> = header
-        .accounts
-        .into_iter()
-        .flat_map(|account| account.items.into_iter().flat_map(parse_item))
-        .collect();
+    let mut items = Vec::new();
+    for account in header.accounts {
+        for item in account.items {
+            items.extend(parse_item(item)?);
+        }
+    }
 
     Ok(items)
 }

@@ -224,9 +224,7 @@ impl DeviceAuthKeyAuthenticator<'_> {
                         .map_err(|_| DeviceAuthKeyError::InvalidPublicKeyCredentialDescriptor)
                 })
                 .transpose()?,
-            extensions: request
-                .extensions
-                .map(passkey::types::ctap2::get_assertion::ExtensionInputs::from),
+            extensions: request.extensions.map(TryInto::try_into).transpose()?,
             options: passkey::types::ctap2::make_credential::Options {
                 rk: request.options.rk,
                 up: true,
@@ -666,6 +664,10 @@ pub enum DeviceAuthKeyError {
     /// An invalid public key credential descriptor was passed in the allow list.
     #[error("An invalid public key credential descriptor was passed in the allow list")]
     InvalidPublicKeyCredentialDescriptor,
+
+    /// An already-hashed PRF input did not contain exactly 32 bytes.
+    #[error(transparent)]
+    InvalidPrfInput(#[from] crate::InvalidPrfInputLengthError),
 
     /// A master password hash could not be generated for the given master password.
     #[error("A master password hash could not be generated for the given master password")]

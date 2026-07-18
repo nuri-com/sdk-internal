@@ -5,6 +5,7 @@ use p256::{
 };
 use passkey::authenticator::{CoseKeyPair, private_key_from_cose_key};
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 #[derive(Debug, Error)]
 pub enum CoseKeyToPkcs8Error {
@@ -14,7 +15,9 @@ pub enum CoseKeyToPkcs8Error {
     FailedToConvertP256PrivateKeyToPkcs8,
 }
 
-pub(crate) fn cose_key_to_pkcs8(cose_key: &CoseKey) -> Result<Vec<u8>, CoseKeyToPkcs8Error> {
+pub(crate) fn cose_key_to_pkcs8(
+    cose_key: &CoseKey,
+) -> Result<Zeroizing<Vec<u8>>, CoseKeyToPkcs8Error> {
     // cose_key.
     let secret_key = private_key_from_cose_key(cose_key).map_err(|error| {
         tracing::error!(?error, "Failed to extract private key from cose_key.");
@@ -30,7 +33,7 @@ pub(crate) fn cose_key_to_pkcs8(cose_key: &CoseKey) -> Result<Vec<u8>, CoseKeyTo
         .as_bytes()
         .to_vec();
 
-    Ok(vec)
+    Ok(Zeroizing::new(vec))
 }
 
 #[derive(Debug, Error)]
@@ -97,6 +100,6 @@ mod tests {
         let cose_key = pkcs8_to_cose_key(&pkcs8).expect("PKCS8 to CoseKey failed");
         let pkcs8_2 = cose_key_to_pkcs8(&cose_key).expect("CoseKey to PKCS8 failed");
 
-        assert_eq!(pkcs8, pkcs8_2);
+        assert_eq!(pkcs8.as_slice(), pkcs8_2.as_slice());
     }
 }

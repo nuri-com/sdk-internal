@@ -5,9 +5,11 @@ use bitwarden_crypto::KeyStoreContext;
 use bitwarden_encoding::{B64Url, NotB64UrlEncodedError};
 use bitwarden_vault::{
     CipherError, CipherView, Fido2CredentialFullView, Fido2CredentialNewView, Fido2CredentialView,
+    Fido2ExtensionStateView,
 };
 use crypto::{CoseKeyToPkcs8Error, PrivateKeyFromSecretKeyError};
-use passkey::types::{CredentialExtensions, Passkey, ctap2::Aaguid};
+use data_encoding::BASE64URL_NOPAD;
+use passkey::types::{CredentialExtensions, Passkey, StoredHmacSecret, ctap2::Aaguid};
 
 #[cfg(feature = "uniffi")]
 uniffi::setup_scaffolding!();
@@ -39,15 +41,17 @@ pub use traits::{
 };
 pub use types::{
     AuthenticatorAssertionResponse, AuthenticatorAttestationResponse, ClientData,
-    Fido2CredentialAutofillView, Fido2CredentialAutofillViewError, GetAssertionExtensionsInput,
-    GetAssertionExtensionsOutput, GetAssertionPrfInput, GetAssertionPrfOutput, GetAssertionRequest,
-    GetAssertionResult, MakeCredentialExtensionsInput, MakeCredentialExtensionsOutput,
+    ClientExtensionResults, ClientPrfOutput, CredPropsResult, Fido2CredentialAutofillView,
+    Fido2CredentialAutofillViewError, GetAssertionExtensionsInput, GetAssertionExtensionsOutput,
+    GetAssertionPrfInput, GetAssertionPrfOutput, GetAssertionRequest, GetAssertionResult,
+    InvalidPrfInputLengthError, MakeCredentialExtensionsInput, MakeCredentialExtensionsOutput,
     MakeCredentialPrfInput, MakeCredentialPrfOutput, MakeCredentialRequest, MakeCredentialResult,
     Options, Origin, PrfInputValues, PrfOutputValues,
     PublicKeyCredentialAuthenticatorAssertionResponse,
     PublicKeyCredentialAuthenticatorAttestationResponse, PublicKeyCredentialRpEntity,
     PublicKeyCredentialUserEntity, UnverifiedAssetLink,
 };
+use zeroize::{Zeroize, Zeroizing};
 
 use self::crypto::{cose_key_to_pkcs8, pkcs8_to_cose_key};
 
@@ -82,6 +86,12 @@ impl CipherViewContainer {
     }
 }
 
+impl Drop for CipherViewContainer {
+    fn drop(&mut self) {
+        self.fido2_credentials.zeroize();
+    }
+}
+
 #[allow(missing_docs)]
 #[derive(Debug, Error)]
 pub enum Fido2Error {
@@ -102,6 +112,12 @@ pub enum Fido2Error {
 
     #[error("Invalid counter")]
     InvalidCounter,
+
+    #[error("Unsupported PRF/HMAC algorithm: {0}")]
+    UnsupportedHmacAlgorithm(String),
+
+    #[error("Invalid {field} HMAC seed length: expected 32 bytes, got {actual}")]
+    InvalidHmacSeedLength { field: &'static str, actual: usize },
 }
 
 impl TryFrom<CipherViewContainer> for Passkey {
@@ -117,16 +133,71 @@ impl TryFrom<CipherViewContainer> for Passkey {
     }
 }
 
+const HMAC_SEED_LENGTH: usize = 32;
+
+fn decode_hmac_seed(field: &'static str, value: &str) -> Result<Vec<u8>, Fido2Error> {
+    let seed = B64Url::try_from(value)?.into_bytes();
+    if seed.len() != HMAC_SEED_LENGTH {
+        return Err(Fido2Error::InvalidHmacSeedLength {
+            field,
+            actual: seed.len(),
+        });
+    }
+    Ok(seed)
+}
+
+pub(crate) fn stored_hmac_secret_from_extension_state(
+    extension_state: Option<&Fido2ExtensionStateView>,
+) -> Result<Option<StoredHmacSecret>, Fido2Error> {
+    let Some(extension_state) = extension_state else {
+        return Ok(None);
+    };
+
+    if extension_state.prf_hmac_algorithm != "hmac-secret" {
+        return Err(Fido2Error::UnsupportedHmacAlgorithm(
+            extension_state.prf_hmac_algorithm.clone(),
+        ));
+    }
+
+    let cred_with_uv = decode_hmac_seed("UV", &extension_state.uv_hmac_seed)?;
+    let cred_without_uv = extension_state
+        .non_uv_hmac_seed
+        .as_deref()
+        .map(|seed| decode_hmac_seed("non-UV", seed))
+        .transpose()?;
+
+    // These decoded vectors move directly into passkey-rs' `StoredHmacSecret`, which implements
+    // `ZeroizeOnDrop`. Wrapping and then extracting them here would only create a false sense of
+    // protection by returning the same allocation without a drop guard.
+    Ok(Some(StoredHmacSecret {
+        cred_with_uv,
+        cred_without_uv,
+    }))
+}
+
 fn try_from_credential_full_view(value: Fido2CredentialFullView) -> Result<Passkey, Fido2Error> {
+    let mut value = Zeroizing::new(value);
     let counter: u32 = value
         .counter
         .parse()
         .map_err(|_| Fido2Error::InvalidCounter)?;
     let counter = (counter != 0).then_some(counter);
-    let key_value = B64Url::try_from(value.key_value)?;
-    let user_handle = value.user_handle.map(B64Url::try_from).transpose()?;
+    let encoded_private_key = Zeroizing::new(std::mem::take(&mut value.key_value));
+    let private_key = Zeroizing::new(B64Url::try_from(encoded_private_key.as_str())?.into_bytes());
+    let user_handle = value
+        .user_handle
+        .as_deref()
+        .map(B64Url::try_from)
+        .transpose()?;
 
-    let key = pkcs8_to_cose_key(key_value.as_bytes())?;
+    let key = pkcs8_to_cose_key(private_key.as_slice())?;
+
+    // `CoseKey` owns the long-lived private scalar. passkey-rs cannot currently implement
+    // `Zeroize` for that type, so default SDK builds rely on bitwarden-crypto's global
+    // `ZeroizingAllocator` to clear its heap allocation when it is released. The encoded and
+    // decoded temporary buffers above remain explicitly guarded.
+
+    let hmac_secret = stored_hmac_secret_from_extension_state(value.extension_state.as_ref())?;
 
     Ok(Passkey {
         key,
@@ -134,7 +205,7 @@ fn try_from_credential_full_view(value: Fido2CredentialFullView) -> Result<Passk
         rp_id: value.rp_id.clone(),
         user_handle: user_handle.map(|u| u.into_bytes().into()),
         counter,
-        extensions: CredentialExtensions { hmac_secret: None },
+        extensions: CredentialExtensions { hmac_secret },
     })
 }
 
@@ -145,24 +216,86 @@ pub enum FillCredentialError {
     InvalidInputLength(#[from] InvalidInputLengthError),
     #[error(transparent)]
     CoseKeyToPkcs8(#[from] CoseKeyToPkcs8Error),
+    #[error("{0}")]
+    UnsupportedAlgorithm(String),
+    #[error("Invalid {field} HMAC seed length: expected 32 bytes, got {actual}")]
+    InvalidHmacSeedLength { field: &'static str, actual: usize },
+    #[error("Existing extension state is present but the passkey has no HMAC secret")]
+    MissingHmacSecret,
 }
 
-#[allow(missing_docs)]
-pub fn fill_with_credential(
+fn extension_state_from_hmac_secret(
+    hmac_secret: Option<&StoredHmacSecret>,
+    existing: Option<&Fido2ExtensionStateView>,
+) -> Result<Option<Fido2ExtensionStateView>, FillCredentialError> {
+    let Some(hmac_secret) = hmac_secret else {
+        return if existing.is_some() {
+            Err(FillCredentialError::MissingHmacSecret)
+        } else {
+            Ok(None)
+        };
+    };
+
+    for (field, seed) in [
+        ("UV", Some(hmac_secret.cred_with_uv.as_slice())),
+        (
+            "non-UV",
+            hmac_secret.cred_without_uv.as_ref().map(Vec::as_slice),
+        ),
+    ] {
+        if let Some(seed) = seed
+            && seed.len() != HMAC_SEED_LENGTH
+        {
+            return Err(FillCredentialError::InvalidHmacSeedLength {
+                field,
+                actual: seed.len(),
+            });
+        }
+    }
+
+    Ok(Some(Fido2ExtensionStateView {
+        prf_hmac_algorithm: existing
+            .map(|state| state.prf_hmac_algorithm.clone())
+            .unwrap_or_else(|| "hmac-secret".to_string()),
+        uv_hmac_seed: BASE64URL_NOPAD.encode(&hmac_secret.cred_with_uv),
+        non_uv_hmac_seed: hmac_secret
+            .cred_without_uv
+            .as_ref()
+            .map(|seed| BASE64URL_NOPAD.encode(seed)),
+        cred_blob: existing.and_then(|state| state.cred_blob.clone()),
+        large_blob: existing.and_then(|state| state.large_blob.clone()),
+        key_algorithm_metadata: existing
+            .map(|state| state.key_algorithm_metadata.clone())
+            .unwrap_or_else(|| "ES256".to_string()),
+    }))
+}
+
+pub(crate) fn fill_with_credential_preserving_extension_state(
     view: &Fido2CredentialView,
     value: Passkey,
+    existing_extension_state: Option<&Fido2ExtensionStateView>,
 ) -> Result<Fido2CredentialFullView, FillCredentialError> {
-    let cred_id: Vec<u8> = value.credential_id.into();
     let user_handle = value
         .user_handle
         .map(|u| B64Url::from(u.to_vec()).to_string());
-    let key_value = B64Url::from(cose_key_to_pkcs8(&value.key)?).to_string();
+    let private_key = cose_key_to_pkcs8(&value.key)?;
+    let key_value = BASE64URL_NOPAD.encode(private_key.as_slice());
+
+    // Derive key algorithm and curve from the COSE key instead of hardcoding ECDSA/P-256.
+    let (key_algorithm, key_curve) = derive_algorithm_from_cose_key(&value.key)?;
+
+    let extension_state = extension_state_from_hmac_secret(
+        value.extensions.hmac_secret.as_ref(),
+        existing_extension_state,
+    )?;
 
     Ok(Fido2CredentialFullView {
-        credential_id: guid_bytes_to_string(&cred_id)?,
+        // Keep the existing representation as well as the bytes. CXF credential IDs are
+        // arbitrary byte strings and use Bitwarden's `b64.` form rather than a 16-byte UUID.
+        credential_id: view.credential_id.clone(),
         key_type: "public-key".to_owned(),
-        key_algorithm: "ECDSA".to_owned(),
-        key_curve: "P-256".to_owned(),
+        key_algorithm,
+        key_curve,
         key_value,
         rp_id: value.rp_id,
         rp_name: view.rp_name.clone(),
@@ -173,7 +306,75 @@ pub fn fill_with_credential(
         user_display_name: view.user_display_name.clone(),
         discoverable: "true".to_owned(),
         creation_date: chrono::offset::Utc::now(),
+        extension_state,
     })
+}
+
+#[allow(missing_docs)]
+pub fn fill_with_credential(
+    view: &Fido2CredentialView,
+    value: Passkey,
+) -> Result<Fido2CredentialFullView, FillCredentialError> {
+    fill_with_credential_preserving_extension_state(view, value, None)
+}
+
+/// Derive the key algorithm and curve name from a COSE key.
+///
+/// Returns `(algorithm_name, curve_name)` or an error for unsupported algorithms.
+/// This validates the imported signing-key algorithm instead of silently hardcoding ECDSA P-256.
+fn derive_algorithm_from_cose_key(
+    key: &coset::CoseKey,
+) -> Result<(String, String), FillCredentialError> {
+    use coset::{Label, RegisteredLabel, RegisteredLabelWithPrivate, iana::EnumI64};
+
+    match &key.kty {
+        RegisteredLabel::Assigned(coset::iana::KeyType::EC2) => {}
+        other => {
+            return Err(FillCredentialError::UnsupportedAlgorithm(format!(
+                "unsupported COSE key type: {other:?}, expected EC2"
+            )));
+        }
+    }
+
+    match key.alg.as_ref() {
+        Some(RegisteredLabelWithPrivate::Assigned(coset::iana::Algorithm::ES256)) => {}
+        Some(other) => {
+            return Err(FillCredentialError::UnsupportedAlgorithm(format!(
+                "unsupported COSE algorithm: {other:?}, expected ES256"
+            )));
+        }
+        None => {
+            return Err(FillCredentialError::UnsupportedAlgorithm(
+                "missing COSE algorithm, expected ES256".to_string(),
+            ));
+        }
+    }
+
+    let curve = key
+        .params
+        .iter()
+        .find_map(|(label, value)| {
+            if label == &Label::Int(-1) {
+                value
+                    .as_integer()
+                    .and_then(|value| i64::try_from(i128::from(value)).ok())
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| {
+            FillCredentialError::UnsupportedAlgorithm(
+                "missing COSE EC2 curve, expected P-256".to_string(),
+            )
+        })?;
+
+    if curve != coset::iana::EllipticCurve::P_256.to_i64() {
+        return Err(FillCredentialError::UnsupportedAlgorithm(format!(
+            "unsupported COSE EC2 curve: {curve}, expected P-256"
+        )));
+    }
+
+    Ok(("ECDSA".to_string(), "P-256".to_string()))
 }
 
 pub(crate) fn try_from_credential_new_view(
@@ -207,14 +408,20 @@ pub(crate) fn try_from_credential_full(
     options: passkey::types::ctap2::get_assertion::Options,
 ) -> Result<Fido2CredentialFullView, FillCredentialError> {
     let cred_id: Vec<u8> = value.credential_id.into();
-    let key_value = B64Url::from(cose_key_to_pkcs8(&value.key)?).to_string();
+    let private_key = cose_key_to_pkcs8(&value.key)?;
+    let key_value = BASE64URL_NOPAD.encode(private_key.as_slice());
     let user_handle = B64Url::from(user.id.to_vec()).to_string();
+
+    let (key_algorithm, key_curve) = derive_algorithm_from_cose_key(&value.key)?;
+
+    let extension_state =
+        extension_state_from_hmac_secret(value.extensions.hmac_secret.as_ref(), None)?;
 
     Ok(Fido2CredentialFullView {
         credential_id: guid_bytes_to_string(&cred_id)?,
         key_type: "public-key".to_owned(),
-        key_algorithm: "ECDSA".to_owned(),
-        key_curve: "P-256".to_owned(),
+        key_algorithm,
+        key_curve,
         key_value,
         rp_id: value.rp_id,
         rp_name: rp.name,
@@ -225,6 +432,7 @@ pub(crate) fn try_from_credential_full(
         user_display_name: user.display_name,
         discoverable: options.rk.to_string(),
         creation_date: chrono::offset::Utc::now(),
+        extension_state,
     })
 }
 
@@ -282,9 +490,53 @@ fn get_string_name_from_enum(s: impl serde::Serialize) -> Result<String, serde_j
 
 #[cfg(test)]
 mod tests {
+    use bitwarden_encoding::B64Url;
+    use bitwarden_vault::{Fido2CredentialFullView, Fido2ExtensionStateView};
+    use coset::{Label, RegisteredLabel, RegisteredLabelWithPrivate, iana::EnumI64};
     use passkey::types::webauthn::AuthenticatorAttachment;
 
-    use super::{get_enum_from_string_name, get_string_name_from_enum};
+    use super::{
+        Fido2Error, FillCredentialError, StoredHmacSecret, derive_algorithm_from_cose_key,
+        extension_state_from_hmac_secret, get_enum_from_string_name, get_string_name_from_enum,
+        pkcs8_to_cose_key, stored_hmac_secret_from_extension_state,
+    };
+
+    const TEST_KEY_VALUE: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgPzvtWYWmIsvqqr3LsZB0K-cbjuhJSGTGziL1LksHAPShRANCAAT-vqHTyEDS9QBNNi2BNLyu6TunubJT_L3G3i7KLpEDhMD15hi24IjGBH0QylJIrvlT4JN2tdRGF436XGc-VoAl";
+
+    fn extension_state() -> Fido2ExtensionStateView {
+        Fido2ExtensionStateView {
+            prf_hmac_algorithm: "hmac-secret".to_string(),
+            uv_hmac_seed: B64Url::from(vec![0x11; 32]).to_string(),
+            non_uv_hmac_seed: Some(B64Url::from(vec![0x22; 32]).to_string()),
+            cred_blob: None,
+            large_blob: None,
+            key_algorithm_metadata: "ES256".to_string(),
+        }
+    }
+
+    fn full_view(extension_state: Option<Fido2ExtensionStateView>) -> Fido2CredentialFullView {
+        Fido2CredentialFullView {
+            credential_id: "b64.1UiCbnm020Cj2BERb36DSQ".to_string(),
+            key_type: "public-key".to_string(),
+            key_algorithm: "ECDSA".to_string(),
+            key_curve: "P-256".to_string(),
+            key_value: TEST_KEY_VALUE.to_string(),
+            rp_id: "nuri.com".to_string(),
+            user_handle: Some("YWxleCBtdWxsZXI".to_string()),
+            user_name: Some("test@nuri.com".to_string()),
+            counter: "0".to_string(),
+            rp_name: Some("Nuri".to_string()),
+            user_display_name: Some("Test User".to_string()),
+            discoverable: "true".to_string(),
+            creation_date: chrono::offset::Utc::now(),
+            extension_state,
+        }
+    }
+
+    fn cose_key() -> coset::CoseKey {
+        let key = B64Url::try_from(TEST_KEY_VALUE).unwrap();
+        pkcs8_to_cose_key(key.as_bytes()).unwrap()
+    }
 
     #[test]
     fn test_enum_string_conversion_works_as_expected() {
@@ -321,5 +573,193 @@ mod tests {
                 213, 72, 130, 110, 121, 180, 219, 64, 163, 216, 17, 17, 111, 126, 131, 73
             ]
         );
+    }
+
+    #[test]
+    fn test_try_from_credential_full_view_bridges_hmac_state() {
+        let passkey =
+            super::try_from_credential_full_view(full_view(Some(extension_state()))).unwrap();
+
+        let hmac = passkey
+            .extensions
+            .hmac_secret
+            .as_ref()
+            .expect("hmac_secret should be bridged from extension_state");
+        assert_eq!(hmac.cred_with_uv, vec![0x11; 32]);
+        assert_eq!(hmac.cred_without_uv, Some(vec![0x22; 32]));
+    }
+
+    #[test]
+    fn test_try_from_credential_full_view_without_extension_state() {
+        let passkey = super::try_from_credential_full_view(full_view(None)).unwrap();
+        assert!(
+            passkey.extensions.hmac_secret.is_none(),
+            "hmac_secret should be None when extension_state is None"
+        );
+    }
+
+    #[test]
+    fn debug_redacts_private_key_and_hmac_seeds() {
+        let state = extension_state();
+        let uv_seed = state.uv_hmac_seed.clone();
+        let non_uv_seed = state
+            .non_uv_hmac_seed
+            .clone()
+            .expect("test state should contain a non-UV seed");
+
+        let state_debug = format!("{state:?}");
+        assert!(!state_debug.contains(&uv_seed));
+        assert!(!state_debug.contains(&non_uv_seed));
+        assert!(state_debug.contains("<redacted>"));
+
+        let view_debug = format!("{:?}", full_view(Some(state)));
+        assert!(!view_debug.contains(TEST_KEY_VALUE));
+        assert!(!view_debug.contains(&uv_seed));
+        assert!(!view_debug.contains(&non_uv_seed));
+        assert!(view_debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn stored_hmac_secret_rejects_invalid_base64_and_seed_lengths() {
+        let mut invalid_base64 = extension_state();
+        invalid_base64.uv_hmac_seed = "%".to_string();
+        assert!(matches!(
+            stored_hmac_secret_from_extension_state(Some(&invalid_base64)),
+            Err(Fido2Error::Decode(_))
+        ));
+
+        let mut short_uv = extension_state();
+        short_uv.uv_hmac_seed = B64Url::from(vec![0x11; 31]).to_string();
+        assert!(matches!(
+            stored_hmac_secret_from_extension_state(Some(&short_uv)),
+            Err(Fido2Error::InvalidHmacSeedLength {
+                field: "UV",
+                actual: 31
+            })
+        ));
+
+        let mut long_non_uv = extension_state();
+        long_non_uv.non_uv_hmac_seed = Some(B64Url::from(vec![0x22; 33]).to_string());
+        assert!(matches!(
+            stored_hmac_secret_from_extension_state(Some(&long_non_uv)),
+            Err(Fido2Error::InvalidHmacSeedLength {
+                field: "non-UV",
+                actual: 33
+            })
+        ));
+    }
+
+    #[test]
+    fn stored_hmac_secret_rejects_unknown_algorithm() {
+        let mut state = extension_state();
+        state.prf_hmac_algorithm = "future-algorithm".to_string();
+        assert!(matches!(
+            stored_hmac_secret_from_extension_state(Some(&state)),
+            Err(Fido2Error::UnsupportedHmacAlgorithm(algorithm))
+                if algorithm == "future-algorithm"
+        ));
+    }
+
+    #[test]
+    fn extension_update_preserves_opaque_fields() {
+        let existing = Fido2ExtensionStateView {
+            prf_hmac_algorithm: "hmac-secret".to_string(),
+            uv_hmac_seed: B64Url::from(vec![0x01; 32]).to_string(),
+            non_uv_hmac_seed: Some(B64Url::from(vec![0x02; 32]).to_string()),
+            cred_blob: Some("opaque-cred-blob".to_string()),
+            large_blob: Some("opaque-large-blob".to_string()),
+            key_algorithm_metadata: "opaque-key-metadata".to_string(),
+        };
+        let updated_hmac = StoredHmacSecret {
+            cred_with_uv: vec![0x11; 32],
+            cred_without_uv: Some(vec![0x22; 32]),
+        };
+
+        let updated = extension_state_from_hmac_secret(Some(&updated_hmac), Some(&existing))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            updated.uv_hmac_seed,
+            B64Url::from(vec![0x11; 32]).to_string()
+        );
+        assert_eq!(
+            updated.non_uv_hmac_seed,
+            Some(B64Url::from(vec![0x22; 32]).to_string())
+        );
+        assert_eq!(updated.cred_blob, existing.cred_blob);
+        assert_eq!(updated.large_blob, existing.large_blob);
+        assert_eq!(
+            updated.key_algorithm_metadata,
+            existing.key_algorithm_metadata
+        );
+    }
+
+    #[test]
+    fn extension_update_rejects_invalid_outgoing_seed_length() {
+        let hmac = StoredHmacSecret {
+            cred_with_uv: vec![0x11; 31],
+            cred_without_uv: None,
+        };
+        assert!(matches!(
+            extension_state_from_hmac_secret(Some(&hmac), None),
+            Err(FillCredentialError::InvalidHmacSeedLength {
+                field: "UV",
+                actual: 31
+            })
+        ));
+    }
+
+    #[test]
+    fn cose_algorithm_derivation_accepts_only_es256_ec2_p256() {
+        assert_eq!(
+            derive_algorithm_from_cose_key(&cose_key()).unwrap(),
+            ("ECDSA".to_string(), "P-256".to_string())
+        );
+
+        let mut missing_algorithm = cose_key();
+        missing_algorithm.alg = None;
+        assert!(matches!(
+            derive_algorithm_from_cose_key(&missing_algorithm),
+            Err(FillCredentialError::UnsupportedAlgorithm(_))
+        ));
+
+        let mut wrong_algorithm = cose_key();
+        wrong_algorithm.alg = Some(RegisteredLabelWithPrivate::Assigned(
+            coset::iana::Algorithm::RS256,
+        ));
+        assert!(matches!(
+            derive_algorithm_from_cose_key(&wrong_algorithm),
+            Err(FillCredentialError::UnsupportedAlgorithm(_))
+        ));
+
+        let mut wrong_key_type = cose_key();
+        wrong_key_type.kty = RegisteredLabel::Assigned(coset::iana::KeyType::RSA);
+        assert!(matches!(
+            derive_algorithm_from_cose_key(&wrong_key_type),
+            Err(FillCredentialError::UnsupportedAlgorithm(_))
+        ));
+
+        let mut missing_curve = cose_key();
+        missing_curve
+            .params
+            .retain(|(label, _)| label != &Label::Int(-1));
+        assert!(matches!(
+            derive_algorithm_from_cose_key(&missing_curve),
+            Err(FillCredentialError::UnsupportedAlgorithm(_))
+        ));
+
+        let mut wrong_curve = cose_key();
+        let (_, curve) = wrong_curve
+            .params
+            .iter_mut()
+            .find(|(label, _)| label == &Label::Int(-1))
+            .unwrap();
+        *curve =
+            coset::cbor::value::Value::Integer(coset::iana::EllipticCurve::P_384.to_i64().into());
+        assert!(matches!(
+            derive_algorithm_from_cose_key(&wrong_curve),
+            Err(FillCredentialError::UnsupportedAlgorithm(_))
+        ));
     }
 }

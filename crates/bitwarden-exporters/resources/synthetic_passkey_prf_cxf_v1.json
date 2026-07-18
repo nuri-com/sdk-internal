@@ -1,0 +1,57 @@
+{
+  "version": {
+    "major": 1,
+    "minor": 0
+  },
+  "exporterRpId": "synthetic.example",
+  "exporterDisplayName": "Synthetic CXF Test Vector",
+  "timestamp": 1735689600,
+  "accounts": [
+    {
+      "id": "c3ludGhldGljLWFjY291bnQtdjE",
+      "username": "synthetic@nuri.test",
+      "email": "synthetic@nuri.test",
+      "fullName": "Synthetic Nuri Test",
+      "collections": [],
+      "items": [
+        {
+          "id": "c3ludGhldGljLWl0ZW0tdjE",
+          "creationAt": 1735689600,
+          "modifiedAt": 1735689600,
+          "title": "Synthetic Nuri PRF Passkey",
+          "subtitle": "Deterministic interoperability test vector",
+          "favorite": false,
+          "scope": {
+            "urls": [
+              "https://nuri.com"
+            ],
+            "androidApps": []
+          },
+          "credentials": [
+            {
+              "type": "passkey",
+              "credentialId": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+              "rpId": "nuri.com",
+              "username": "synthetic@nuri.test",
+              "userDisplayName": "Synthetic Nuri User",
+              "userHandle": "ICEiIyQlJicoKSorLC0uLw",
+              "key": "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgPzvtWYWmIsvqqr3LsZB0K-cbjuhJSGTGziL1LksHAPShRANCAAT-vqHTyEDS9QBNNi2BNLyu6TunubJT_L3G3i7KLpEDhMD15hi24IjGBH0QylJIrvlT4JN2tdRGF436XGc-VoAl",
+              "fido2Extensions": {
+                "hmacCredentials": {
+                  "algorithm": "hmac-sha256",
+                  "credWithUV": "ERERERERERERERERERERERERERERERERERERERERERE",
+                  "credWithoutUV": "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI"
+                }
+              }
+            }
+          ],
+          "tags": [
+            "synthetic",
+            "passkey",
+            "prf"
+          ]
+        }
+      ]
+    }
+  ]
+}

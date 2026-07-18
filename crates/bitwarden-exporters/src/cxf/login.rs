@@ -113,7 +113,7 @@ fn extensions_to_state_json(
     let Some(ext) = extensions else {
         return Ok(None);
     };
-    if ext.payments.is_some() {
+    if matches!(ext.payments, Some(true)) {
         return Err(PasskeyImportError::UnsupportedPaymentsExtension);
     }
     let Some(hmac) = ext.hmac_credentials.as_ref() else {
@@ -987,6 +987,39 @@ mod tests {
             error,
             PasskeyImportError::UnsupportedPaymentsExtension
         ));
+    }
+
+    #[test]
+    fn test_to_login_accepts_explicit_false_payments_with_hmac_state() {
+        let mut extensions = valid_extensions();
+        extensions.payments = Some(false);
+        let passkey = build_passkey_with_extensions(extensions);
+
+        let login = to_login(Utc::now(), None, Some(&passkey), None, None).unwrap();
+        let credential = &login.fido2_credentials.unwrap()[0];
+        let state: Fido2ExtensionStateView =
+            serde_json::from_str(credential.extension_state.as_ref().unwrap()).unwrap();
+
+        assert_eq!(state.uv_hmac_seed, B64Url::from(vec![0x11; 32]).to_string());
+        assert_eq!(
+            state.non_uv_hmac_seed,
+            Some(B64Url::from(vec![0x22; 32]).to_string())
+        );
+    }
+
+    #[test]
+    fn test_to_login_treats_explicit_false_payments_without_hmac_as_no_state() {
+        let passkey = build_passkey_with_extensions(Fido2Extensions {
+            payments: Some(false),
+            ..Default::default()
+        });
+
+        let login = to_login(Utc::now(), None, Some(&passkey), None, None).unwrap();
+        assert!(
+            login.fido2_credentials.unwrap()[0]
+                .extension_state
+                .is_none()
+        );
     }
 
     #[test]

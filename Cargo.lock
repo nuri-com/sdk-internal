@@ -796,6 +796,7 @@ name = "bitwarden-exporters"
 version = "3.0.0"
 dependencies = [
  "async-trait",
+ "bitwarden-api-api",
  "bitwarden-collections",
  "bitwarden-core",
  "bitwarden-crypto",

@@ -454,17 +454,17 @@ pub struct MakeCredentialExtensionsInput {
     pub prf: Option<MakeCredentialPrfInput>,
 }
 
-impl From<MakeCredentialExtensionsInput>
+impl TryFrom<MakeCredentialExtensionsInput>
     for passkey::types::ctap2::make_credential::ExtensionInputs
 {
-    fn from(value: MakeCredentialExtensionsInput) -> Self {
-        Self {
+    type Error = InvalidPrfInputLengthError;
+
+    fn try_from(value: MakeCredentialExtensionsInput) -> Result<Self, Self::Error> {
+        Ok(Self {
             hmac_secret: None,
             hmac_secret_mc: None,
-            prf: value
-                .prf
-                .map(passkey::types::ctap2::extensions::AuthenticatorPrfInputs::from),
-        }
+            prf: value.prf.map(TryInto::try_into).transpose()?,
+        })
     }
 }
 
@@ -523,12 +523,14 @@ pub struct MakeCredentialPrfInput {
     pub eval: Option<PrfInputValues>,
 }
 
-impl From<MakeCredentialPrfInput> for passkey::types::ctap2::extensions::AuthenticatorPrfInputs {
-    fn from(value: MakeCredentialPrfInput) -> Self {
-        Self {
-            eval: value.eval.map(|v| v.into()),
+impl TryFrom<MakeCredentialPrfInput> for passkey::types::ctap2::extensions::AuthenticatorPrfInputs {
+    type Error = InvalidPrfInputLengthError;
+
+    fn try_from(value: MakeCredentialPrfInput) -> Result<Self, Self::Error> {
+        Ok(Self {
+            eval: value.eval.map(TryInto::try_into).transpose()?,
             eval_by_credential: None,
-        }
+        })
     }
 }
 
@@ -604,14 +606,16 @@ pub struct GetAssertionExtensionsInput {
     pub prf: Option<GetAssertionPrfInput>,
 }
 
-impl From<GetAssertionExtensionsInput> for passkey::types::ctap2::get_assertion::ExtensionInputs {
-    fn from(value: GetAssertionExtensionsInput) -> Self {
-        Self {
+impl TryFrom<GetAssertionExtensionsInput>
+    for passkey::types::ctap2::get_assertion::ExtensionInputs
+{
+    type Error = InvalidPrfInputLengthError;
+
+    fn try_from(value: GetAssertionExtensionsInput) -> Result<Self, Self::Error> {
+        Ok(Self {
             hmac_secret: None,
-            prf: value
-                .prf
-                .map(passkey::types::ctap2::extensions::AuthenticatorPrfInputs::from),
-        }
+            prf: value.prf.map(TryInto::try_into).transpose()?,
+        })
     }
 }
 
@@ -662,24 +666,26 @@ pub struct GetAssertionPrfInput {
     pub eval_by_credential: Option<HashMap<Vec<u8>, PrfInputValues>>,
 }
 
-impl From<GetAssertionPrfInput> for passkey::types::ctap2::extensions::AuthenticatorPrfInputs {
-    fn from(value: GetAssertionPrfInput) -> Self {
+impl TryFrom<GetAssertionPrfInput> for passkey::types::ctap2::extensions::AuthenticatorPrfInputs {
+    type Error = InvalidPrfInputLengthError;
+
+    fn try_from(value: GetAssertionPrfInput) -> Result<Self, Self::Error> {
         let eval_by_credential = if let Some(values) = value.eval_by_credential {
             let map: HashMap<
                 passkey::types::Bytes,
                 passkey::types::ctap2::extensions::AuthenticatorPrfValues,
             > = values
                 .into_iter()
-                .map(|(k, v)| (k.into(), v.into()))
-                .collect();
+                .map(|(k, v)| Ok((k.into(), v.try_into()?)))
+                .collect::<Result<_, InvalidPrfInputLengthError>>()?;
             Some(map)
         } else {
             None
         };
-        Self {
-            eval: value.eval.map(|v| v.into()),
+        Ok(Self {
+            eval: value.eval.map(TryInto::try_into).transpose()?,
             eval_by_credential,
-        }
+        })
     }
 }
 
@@ -807,6 +813,10 @@ pub struct PrfInputValues {
 
     /// An optional secondary input on which to evaluate PRF.
     pub second: Option<Vec<u8>>,
+
+    /// Whether these values already contain the 32-byte WebAuthn PRF domain-separated hashes.
+    /// Apple AuthenticationServices supplies this form and it must not be hashed again.
+    pub already_hashed: bool,
 }
 
 impl PrfInputValues {
@@ -822,22 +832,53 @@ impl std::fmt::Debug for PrfInputValues {
         f.debug_struct("PrfInputValues")
             .field("first", &"********")
             .field("second", &self.second.as_ref().map(|_| "********"))
+            .field("already_hashed", &self.already_hashed)
             .finish()
     }
 }
 
-impl From<PrfInputValues> for passkey::types::ctap2::extensions::AuthenticatorPrfValues {
-    /// This converts PRF input received from a client into the format that
-    /// passkey-rs expects. This is not valid for converting output received from passkey-rs.
-    fn from(value: PrfInputValues) -> Self {
-        // passkey-rs expects the salt input to be hashed already according to
-        // WebAuthn PRF extension client processing rules.
-        let first = PrfInputValues::hash_webauthn_prf_input(value.first.as_ref());
-        let second = value
-            .second
-            .as_deref()
-            .map(PrfInputValues::hash_webauthn_prf_input);
-        Self { first, second }
+/// Invalid length for a WebAuthn PRF input declared as already hashed.
+#[derive(Debug, Error)]
+#[error("Already-hashed WebAuthn PRF {field} input must be exactly 32 bytes, got {actual}")]
+pub struct InvalidPrfInputLengthError {
+    field: &'static str,
+    actual: usize,
+}
+
+impl TryFrom<PrfInputValues> for passkey::types::ctap2::extensions::AuthenticatorPrfValues {
+    type Error = InvalidPrfInputLengthError;
+
+    /// Converts raw or explicitly pre-hashed input into the form passkey-rs expects.
+    fn try_from(value: PrfInputValues) -> Result<Self, Self::Error> {
+        if value.already_hashed {
+            let first_len = value.first.len();
+            let first = value
+                .first
+                .try_into()
+                .map_err(|_| InvalidPrfInputLengthError {
+                    field: "first",
+                    actual: first_len,
+                })?;
+            let second = value
+                .second
+                .map(|second| {
+                    let second_len = second.len();
+                    second.try_into().map_err(|_| InvalidPrfInputLengthError {
+                        field: "second",
+                        actual: second_len,
+                    })
+                })
+                .transpose()?;
+            Ok(Self { first, second })
+        } else {
+            // passkey-rs expects raw client inputs to be domain-separated and hashed once.
+            let first = PrfInputValues::hash_webauthn_prf_input(value.first.as_ref());
+            let second = value
+                .second
+                .as_deref()
+                .map(PrfInputValues::hash_webauthn_prf_input);
+            Ok(Self { first, second })
+        }
     }
 }
 
@@ -868,13 +909,59 @@ impl From<passkey::types::ctap2::extensions::AuthenticatorPrfValues> for PrfOutp
         }
     }
 }
+
+impl From<passkey::types::webauthn::AuthenticationExtensionsPrfValues> for PrfOutputValues {
+    fn from(value: passkey::types::webauthn::AuthenticationExtensionsPrfValues) -> Self {
+        Self {
+            first: value.first.to_vec(),
+            second: value.second.map(|second| second.to_vec()),
+        }
+    }
+}
+
+/// WebAuthn PRF client-extension output returned to native clients.
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
-pub struct ClientExtensionResults {
-    pub cred_props: Option<CredPropsResult>,
+pub struct ClientPrfOutput {
+    /// Whether PRF is enabled for a newly created credential. Authentication omits this field.
+    pub enabled: Option<bool>,
+
+    /// PRF results for the requested inputs, when evaluation was requested and succeeded.
+    pub results: Option<PrfOutputValues>,
+}
+
+impl From<passkey::types::webauthn::AuthenticationExtensionsPrfOutputs> for ClientPrfOutput {
+    fn from(value: passkey::types::webauthn::AuthenticationExtensionsPrfOutputs) -> Self {
+        Self {
+            enabled: value.enabled,
+            results: value.results.map(Into::into),
+        }
+    }
 }
 
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+/// WebAuthn client-extension outputs returned to native clients.
+pub struct ClientExtensionResults {
+    /// Credential properties returned during registration, when requested.
+    pub cred_props: Option<CredPropsResult>,
+    /// WebAuthn PRF extension result. The output is ephemeral and must not be persisted.
+    pub prf: Option<ClientPrfOutput>,
+}
+
+impl From<passkey::types::webauthn::AuthenticationExtensionsClientOutputs>
+    for ClientExtensionResults
+{
+    fn from(value: passkey::types::webauthn::AuthenticationExtensionsClientOutputs) -> Self {
+        Self {
+            cred_props: value.cred_props.map(Into::into),
+            prf: value.prf.map(Into::into),
+        }
+    }
+}
+
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+/// WebAuthn credential-properties extension output.
 pub struct CredPropsResult {
+    /// Whether the created credential is discoverable, when reported.
     pub rk: Option<bool>,
 }
 
@@ -1094,10 +1181,11 @@ mod tests {
                 eval: Some(PrfInputValues {
                     first: TEST_SALT1_RAW_INPUT.to_vec(),
                     second: Some(TEST_SALT2_RAW_INPUT.to_vec()),
+                    already_hashed: false,
                 }),
             }),
         };
-        let transformed = make_credential::ExtensionInputs::from(input);
+        let transformed: make_credential::ExtensionInputs = input.try_into().unwrap();
         let eval = transformed.prf.unwrap().eval.unwrap();
         assert_eq!(TEST_SALT1_WEBAUTHN_INPUT, eval.first);
         assert_eq!(TEST_SALT2_WEBAUTHN_INPUT, eval.second.unwrap());
@@ -1127,14 +1215,54 @@ mod tests {
                 eval: Some(PrfInputValues {
                     first: TEST_SALT1_RAW_INPUT.to_vec(),
                     second: Some(TEST_SALT2_RAW_INPUT.to_vec()),
+                    already_hashed: false,
                 }),
                 eval_by_credential: None,
             }),
         };
-        let transformed = get_assertion::ExtensionInputs::from(input);
+        let transformed: get_assertion::ExtensionInputs = input.try_into().unwrap();
         let eval = transformed.prf.unwrap().eval.unwrap();
         assert_eq!(TEST_SALT1_WEBAUTHN_INPUT, eval.first);
         assert_eq!(TEST_SALT2_WEBAUTHN_INPUT, eval.second.unwrap());
+    }
+
+    #[test]
+    fn test_transform_get_assertion_already_hashed_input_is_not_hashed_again() {
+        let input = GetAssertionExtensionsInput {
+            prf: Some(GetAssertionPrfInput {
+                eval: Some(PrfInputValues {
+                    first: TEST_SALT1_WEBAUTHN_INPUT.to_vec(),
+                    second: Some(TEST_SALT2_WEBAUTHN_INPUT.to_vec()),
+                    already_hashed: true,
+                }),
+                eval_by_credential: None,
+            }),
+        };
+
+        let transformed: get_assertion::ExtensionInputs = input.try_into().unwrap();
+        let eval = transformed.prf.unwrap().eval.unwrap();
+        assert_eq!(TEST_SALT1_WEBAUTHN_INPUT, eval.first);
+        assert_eq!(TEST_SALT2_WEBAUTHN_INPUT, eval.second.unwrap());
+    }
+
+    #[test]
+    fn test_transform_get_assertion_rejects_invalid_already_hashed_length() {
+        let input = GetAssertionExtensionsInput {
+            prf: Some(GetAssertionPrfInput {
+                eval: Some(PrfInputValues {
+                    first: vec![0; 31],
+                    second: None,
+                    already_hashed: true,
+                }),
+                eval_by_credential: None,
+            }),
+        };
+
+        let result = get_assertion::ExtensionInputs::try_from(input);
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Already-hashed WebAuthn PRF first input must be exactly 32 bytes, got 31"
+        );
     }
 
     #[test]
@@ -1148,11 +1276,12 @@ mod tests {
                     PrfInputValues {
                         first: TEST_SALT1_RAW_INPUT.to_vec(),
                         second: Some(TEST_SALT2_RAW_INPUT.to_vec()),
+                        already_hashed: false,
                     },
                 )])),
             }),
         };
-        let transformed = get_assertion::ExtensionInputs::from(input);
+        let transformed: get_assertion::ExtensionInputs = input.try_into().unwrap();
         let output = transformed.prf.unwrap().eval_by_credential.unwrap();
         let results = output.get(&cred_id.into()).unwrap();
         assert_eq!(TEST_SALT1_WEBAUTHN_INPUT, results.first);

@@ -10,10 +10,7 @@ use super::{
     PublicKeyCredentialAuthenticatorAttestationResponse,
     authenticator::GetSelectedCredentialError,
     get_string_name_from_enum,
-    types::{
-        AuthenticatorAssertionResponse, AuthenticatorAttestationResponse, ClientData,
-        ClientExtensionResults, CredPropsResult, Origin,
-    },
+    types::{AuthenticatorAssertionResponse, AuthenticatorAttestationResponse, ClientData, Origin},
 };
 use crate::types::InvalidOriginError;
 
@@ -123,9 +120,7 @@ impl Fido2Client<'_> {
                 .authenticator_attachment
                 .map(get_string_name_from_enum)
                 .transpose()?,
-            client_extension_results: ClientExtensionResults {
-                cred_props: result.client_extension_results.cred_props.map(Into::into),
-            },
+            client_extension_results: result.client_extension_results.into(),
             response: AuthenticatorAttestationResponse {
                 client_data_json: result.response.client_data_json.into(),
                 authenticator_data: result.response.authenticator_data.into(),
@@ -175,12 +170,7 @@ impl Fido2Client<'_> {
                 .authenticator_attachment
                 .map(get_string_name_from_enum)
                 .transpose()?,
-            client_extension_results: ClientExtensionResults {
-                cred_props: result
-                    .client_extension_results
-                    .cred_props
-                    .map(|c| CredPropsResult { rk: c.discoverable }),
-            },
+            client_extension_results: result.client_extension_results.into(),
             response: AuthenticatorAssertionResponse {
                 client_data_json: result.response.client_data_json.into(),
                 authenticator_data: result.response.authenticator_data.into(),

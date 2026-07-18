@@ -41,9 +41,10 @@ pub use traits::{
 };
 pub use types::{
     AuthenticatorAssertionResponse, AuthenticatorAttestationResponse, ClientData,
-    Fido2CredentialAutofillView, Fido2CredentialAutofillViewError, GetAssertionExtensionsInput,
-    GetAssertionExtensionsOutput, GetAssertionPrfInput, GetAssertionPrfOutput, GetAssertionRequest,
-    GetAssertionResult, MakeCredentialExtensionsInput, MakeCredentialExtensionsOutput,
+    ClientExtensionResults, ClientPrfOutput, CredPropsResult, Fido2CredentialAutofillView,
+    Fido2CredentialAutofillViewError, GetAssertionExtensionsInput, GetAssertionExtensionsOutput,
+    GetAssertionPrfInput, GetAssertionPrfOutput, GetAssertionRequest, GetAssertionResult,
+    InvalidPrfInputLengthError, MakeCredentialExtensionsInput, MakeCredentialExtensionsOutput,
     MakeCredentialPrfInput, MakeCredentialPrfOutput, MakeCredentialRequest, MakeCredentialResult,
     Options, Origin, PrfInputValues, PrfOutputValues,
     PublicKeyCredentialAuthenticatorAssertionResponse,
@@ -274,7 +275,6 @@ pub(crate) fn fill_with_credential_preserving_extension_state(
     value: Passkey,
     existing_extension_state: Option<&Fido2ExtensionStateView>,
 ) -> Result<Fido2CredentialFullView, FillCredentialError> {
-    let cred_id: Vec<u8> = value.credential_id.into();
     let user_handle = value
         .user_handle
         .map(|u| B64Url::from(u.to_vec()).to_string());
@@ -290,7 +290,9 @@ pub(crate) fn fill_with_credential_preserving_extension_state(
     )?;
 
     Ok(Fido2CredentialFullView {
-        credential_id: guid_bytes_to_string(&cred_id)?,
+        // Keep the existing representation as well as the bytes. CXF credential IDs are
+        // arbitrary byte strings and use Bitwarden's `b64.` form rather than a 16-byte UUID.
+        credential_id: view.credential_id.clone(),
         key_type: "public-key".to_owned(),
         key_algorithm,
         key_curve,

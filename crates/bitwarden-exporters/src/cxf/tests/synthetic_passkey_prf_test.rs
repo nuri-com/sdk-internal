@@ -193,6 +193,7 @@ mod tests {
                     eval: Some(PrfInputValues {
                         first: b"nuri-prf-salt-v1".to_vec(),
                         second: Some(b"test-salt-2".to_vec()),
+                        already_hashed: false,
                     }),
                     eval_by_credential: None,
                 }),

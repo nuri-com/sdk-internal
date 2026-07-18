@@ -38,8 +38,6 @@ mod tests {
         "BP6-odPIQNL1AE02LYE0vK7pO6e5slP8vcbeLsoukQOEwPXmGLbgiMYEfRDKUkiu-VPgk3a11EYXjfpcZz5WgCU";
     const EXPECTED_UV_FIRST: &str = "d8i94nf9OSyRco1LXP3wnUrRte5rCmguP3cURrj06go";
     const EXPECTED_UV_SECOND: &str = "wxVdw-_rf1oJwrVQn-r6p4nqgf_dJgsfBDutwJNqdEY";
-    const EXPECTED_NON_UV_FIRST: &str = "bC5nGXrEHZvqT8xWOygtFszTXK3xVFxUjKs81mCSZJc";
-    const EXPECTED_NON_UV_SECOND: &str = "Nt9iqYcDEZ2LEUJqHn-H4uCga23ML6wUTuPmjM95dP4";
     const CLIENT_DATA_HASH: [u8; 32] = [0xa5; 32];
 
     fn decode_b64url(value: &str) -> Vec<u8> {
@@ -77,15 +75,36 @@ mod tests {
 
     struct MockUserInterface {
         user_verified: bool,
+        seen_verifications: Mutex<Vec<Verification>>,
+    }
+
+    impl MockUserInterface {
+        fn verified() -> Self {
+            Self {
+                user_verified: true,
+                seen_verifications: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn assert_last_verification_required(&self) {
+            assert!(matches!(
+                self.seen_verifications.lock().unwrap().last(),
+                Some(Verification::Required)
+            ));
+        }
     }
 
     #[async_trait]
     impl Fido2UserInterface for MockUserInterface {
         async fn check_user<'a>(
             &self,
-            _options: CheckUserOptions,
+            options: CheckUserOptions,
             _hint: UiHint<'a, CipherView>,
         ) -> Result<CheckUserResult, Fido2CallbackError> {
+            self.seen_verifications
+                .lock()
+                .unwrap()
+                .push(options.require_verification);
             Ok(CheckUserResult {
                 user_present: true,
                 user_verified: self.user_verified,
@@ -159,14 +178,15 @@ mod tests {
         }
     }
 
-    fn request(verification: Verification) -> GetAssertionRequest {
+    fn webauthn_prf_request() -> GetAssertionRequest {
         GetAssertionRequest {
             rp_id: "nuri.com".to_string(),
             client_data_hash: CLIENT_DATA_HASH.to_vec(),
             allow_list: None,
             options: Options::from(CheckUserOptions {
                 require_presence: true,
-                require_verification: verification,
+                // WebAuthn PRF must override this RP preference to Required.
+                require_verification: Verification::Discouraged,
             }),
             extensions: Some(GetAssertionExtensionsInput {
                 prf: Some(GetAssertionPrfInput {
@@ -248,30 +268,38 @@ mod tests {
         assert_eq!(after.extension_state, before.extension_state);
     }
 
-    async fn assert_literal_prf_and_signature(
-        client: &Client,
-        cipher: CipherView,
-        verification: Verification,
-        user_verified: bool,
-        expected_first: &str,
-        expected_second: &str,
-    ) {
-        let user_interface = MockUserInterface { user_verified };
+    async fn assert_literal_uv_prf_and_signature(client: &Client, cipher: CipherView) {
+        let user_interface = MockUserInterface::verified();
         let credential_store = MockCredentialStore::new(cipher);
         let mut authenticator = Fido2Authenticator::new(client, &user_interface, &credential_store);
 
         let result = authenticator
-            .get_assertion(request(verification))
+            .get_assertion(webauthn_prf_request())
             .await
             .unwrap();
+        user_interface.assert_last_verification_required();
         assert_eq!(result.credential_id, decode_b64url(EXPECTED_CREDENTIAL_ID));
         assert_eq!(result.user_handle, decode_b64url(EXPECTED_USER_HANDLE));
 
         let outputs = result.extensions.prf.unwrap().results;
-        assert_eq!(outputs.first, decode_b64url(expected_first));
+        assert_eq!(outputs.first, decode_b64url(EXPECTED_UV_FIRST));
         assert_eq!(
             outputs.second.as_deref(),
-            Some(decode_b64url(expected_second).as_slice())
+            Some(decode_b64url(EXPECTED_UV_SECOND).as_slice())
+        );
+
+        assert_eq!(
+            &result.authenticator_data[..32],
+            Sha256::digest(b"nuri.com").as_slice(),
+            "authenticator data must bind the assertion to the fixture RP ID"
+        );
+        let flags = result.authenticator_data[32];
+        assert_ne!(flags & 0x01, 0, "UP flag must be set");
+        assert_ne!(flags & 0x04, 0, "UV flag must be set");
+        assert_eq!(
+            &result.authenticator_data[33..37],
+            &[0; 4],
+            "fixture signature counter must remain zero"
         );
 
         let public_key = decode_b64url(EXPECTED_PUBLIC_KEY_SEC1);
@@ -309,8 +337,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn synthetic_cxf_identity_and_literal_prf_survive_encrypted_reload() {
+    async fn synthetic_cxf_account_import_preserves_uv_prf_through_key_rotation() {
         let (header, fixture_passkey) = parse_fixture();
+        // `import_cxf` deliberately accepts one serialized CXF account, not the Header
+        // envelope. The full Header fixture remains the canonical interchange oracle.
         let account_payload = serde_json::to_string(&header.accounts[0]).unwrap();
         let import_client = create_client();
         let encrypted_cipher = import_client
@@ -328,37 +358,47 @@ mod tests {
         let before_reload = decrypt_fixture_credential(&import_client, &imported_view);
         assert_imported_identity(&before_reload, &fixture_passkey);
 
-        assert_literal_prf_and_signature(
-            &import_client,
-            imported_view.clone(),
-            Verification::Required,
-            true,
-            EXPECTED_UV_FIRST,
-            EXPECTED_UV_SECOND,
-        )
-        .await;
-        assert_literal_prf_and_signature(
-            &import_client,
-            imported_view.clone(),
-            Verification::Discouraged,
-            false,
-            EXPECTED_NON_UV_FIRST,
-            EXPECTED_NON_UV_SECOND,
-        )
-        .await;
+        assert_literal_uv_prf_and_signature(&import_client, imported_view.clone()).await;
 
-        let extension_ciphertext_before_rotation = encrypted_extension_state(&imported_view);
-        let mut rotated_view = imported_view;
+        // Start from a real wrapped cipher key, then rotate it to a distinct key.
+        let mut keyed_view = imported_view;
+        keyed_view
+            .generate_cipher_key(
+                &mut import_client.internal.get_key_store().context(),
+                SymmetricKeySlotId::User,
+            )
+            .unwrap();
+        let after_initial_keying = decrypt_fixture_credential(&import_client, &keyed_view);
+        assert_same_portable_credential(&before_reload, &after_initial_keying);
+        let wrapped_cipher_key_before_rotation = keyed_view.key.clone().unwrap();
+        let extension_ciphertext_before_rotation = encrypted_extension_state(&keyed_view);
+
+        let mut rotated_view = keyed_view;
         rotated_view
             .generate_cipher_key(
                 &mut import_client.internal.get_key_store().context(),
                 SymmetricKeySlotId::User,
             )
             .unwrap();
+        let wrapped_cipher_key_after_rotation = rotated_view.key.clone().unwrap();
         let extension_ciphertext_after_rotation = encrypted_extension_state(&rotated_view);
+        assert_ne!(
+            wrapped_cipher_key_after_rotation.to_string(),
+            wrapped_cipher_key_before_rotation.to_string(),
+            "cipher-key rotation must replace the wrapped cipher key"
+        );
         assert_ne!(
             extension_ciphertext_after_rotation, extension_ciphertext_before_rotation,
             "cipher-key rotation must re-encrypt extension state"
+        );
+
+        let mut stale_old_key_view = rotated_view.clone();
+        stale_old_key_view.key = Some(wrapped_cipher_key_before_rotation);
+        assert!(
+            stale_old_key_view
+                .get_fido2_credentials(&mut import_client.internal.get_key_store().context())
+                .is_err(),
+            "rotated credential state must not decrypt through the stale cipher-key path"
         );
 
         let encrypted_reload = import_client
@@ -376,23 +416,6 @@ mod tests {
         assert_imported_identity(&after_reload, &fixture_passkey);
         assert_same_portable_credential(&before_reload, &after_reload);
 
-        assert_literal_prf_and_signature(
-            &reload_client,
-            reloaded_view.clone(),
-            Verification::Required,
-            true,
-            EXPECTED_UV_FIRST,
-            EXPECTED_UV_SECOND,
-        )
-        .await;
-        assert_literal_prf_and_signature(
-            &reload_client,
-            reloaded_view,
-            Verification::Discouraged,
-            false,
-            EXPECTED_NON_UV_FIRST,
-            EXPECTED_NON_UV_SECOND,
-        )
-        .await;
+        assert_literal_uv_prf_and_signature(&reload_client, reloaded_view).await;
     }
 }

@@ -62,7 +62,6 @@ impl PrfEvaluationContext {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PrfValidationFailure {
     MissingSeedState,
-    MissingNonUvSeed,
     InvalidSeedState,
 }
 
@@ -103,11 +102,6 @@ pub enum GetAssertionError {
     InvalidGuid(#[from] InvalidGuidError),
     #[error("missing user")]
     MissingUser,
-    /// PRF was requested without UV, but the credential has no non-UV HMAC seed.
-    #[error(
-        "PRF evaluation failed: non-UV seed required but not present in credential extension state"
-    )]
-    PrfMissingNonUvSeed,
     /// PRF was requested but the credential has no HMAC seed state at all.
     #[error("PRF evaluation failed: no HMAC seed state present in credential")]
     PrfMissingSeedState,
@@ -184,11 +178,21 @@ impl<'a> Fido2Authenticator<'a> {
         &mut self,
         request: MakeCredentialRequest,
     ) -> Result<MakeCredentialResult, MakeCredentialError> {
-        // Insert the received UV to be able to return it later in check_user
+        let evaluates_prf = request
+            .extensions
+            .as_ref()
+            .and_then(|extensions| extensions.prf.as_ref())
+            .is_some_and(|prf| prf.eval.is_some());
+        let effective_uv = evaluates_prf
+            .then_some(UV::Required)
+            .unwrap_or(request.options.uv);
+
+        // WebAuthn PRF evaluation is only available with user verification. Store the
+        // effective requirement so the UI sees the same value as the CTAP request.
         self.requested_uv
             .get_mut()
             .expect("Mutex is not poisoned")
-            .replace(request.options.uv);
+            .replace(effective_uv);
 
         let mut authenticator = self.get_authenticator(true);
 
@@ -222,7 +226,7 @@ impl<'a> Fido2Authenticator<'a> {
                 options: passkey::types::ctap2::make_credential::Options {
                     rk: request.options.rk,
                     up: true,
-                    uv: self.convert_requested_uv(request.options.uv),
+                    uv: self.convert_requested_uv(effective_uv),
                 },
                 pin_auth: None,
                 pin_protocol: None,
@@ -257,6 +261,10 @@ impl<'a> Fido2Authenticator<'a> {
         request: GetAssertionRequest,
     ) -> Result<GetAssertionResult, GetAssertionError> {
         let prf_evaluation = PrfEvaluationContext::from_request(&request);
+        let effective_uv = prf_evaluation
+            .is_some()
+            .then_some(UV::Required)
+            .unwrap_or(request.options.uv);
 
         // Per-request state must never leak from a previous assertion ceremony.
         self.selected_cipher
@@ -272,11 +280,12 @@ impl<'a> Fido2Authenticator<'a> {
             .get_mut()
             .expect("Mutex is not poisoned") = prf_evaluation.clone();
 
-        // Insert the received UV to be able to return it later in check_user
+        // WebAuthn PRF evaluation is only available with user verification. Store the
+        // effective requirement so the UI sees the same value as the CTAP request.
         self.requested_uv
             .get_mut()
             .expect("Mutex is not poisoned")
-            .replace(request.options.uv);
+            .replace(effective_uv);
 
         let response = {
             let mut authenticator = self.get_authenticator(false);
@@ -301,7 +310,7 @@ impl<'a> Fido2Authenticator<'a> {
                     options: passkey::types::ctap2::make_credential::Options {
                         rk: request.options.rk,
                         up: true,
-                        uv: self.convert_requested_uv(request.options.uv),
+                        uv: self.convert_requested_uv(effective_uv),
                     },
                     pin_auth: None,
                     pin_protocol: None,
@@ -322,7 +331,6 @@ impl<'a> Fido2Authenticator<'a> {
         {
             return Err(match failure {
                 PrfValidationFailure::MissingSeedState => GetAssertionError::PrfMissingSeedState,
-                PrfValidationFailure::MissingNonUvSeed => GetAssertionError::PrfMissingNonUvSeed,
                 PrfValidationFailure::InvalidSeedState => GetAssertionError::PrfInvalidSeedState,
             });
         }
@@ -416,12 +424,10 @@ impl<'a> Fido2Authenticator<'a> {
             },
         );
 
-        // Enable PRF/hmac-secret extension on both make_credential and get_assertion.
-        // Setting the config enables on-demand PRF evaluation on get_assertion
-        // (get_prf only checks that the config is present). enable_on_make_credential
-        // additionally gates PRF output during make_credential.
-        // new_without_uv() configures support for both UV and non-UV seeds.
-        authenticator.hmac_secret(HmacSecretConfig::new_without_uv().enable_on_make_credential())
+        // This SDK surface implements WebAuthn PRF, whose hmac-secret evaluation is UV-only.
+        // Imported non-UV CTAP metadata remains in the credential for portability, but this
+        // configuration prevents WebAuthn PRF from ever selecting it.
+        authenticator.hmac_secret(HmacSecretConfig::new_with_uv_only().enable_on_make_credential())
     }
 
     fn convert_requested_uv(&self, uv: UV) -> bool {
@@ -442,12 +448,11 @@ impl<'a> Fido2Authenticator<'a> {
 
         match failure {
             PrfValidationFailure::MissingSeedState => Ctap2Error::MissingParameter,
-            PrfValidationFailure::MissingNonUvSeed => Ctap2Error::UserVerificationBlocked,
             PrfValidationFailure::InvalidSeedState => Ctap2Error::InvalidCredential,
         }
     }
 
-    fn validate_selected_prf_state(&self, user_verified: bool) -> Result<(), Ctap2Error> {
+    fn validate_selected_prf_state(&self) -> Result<(), Ctap2Error> {
         let Some(context) = self
             .prf_evaluation
             .lock()
@@ -482,14 +487,9 @@ impl<'a> Fido2Authenticator<'a> {
             return Ok(());
         }
 
-        let hmac_secret =
-            stored_hmac_secret_from_extension_state(credential.extension_state.as_ref())
-                .map_err(|_| self.fail_prf_validation(PrfValidationFailure::InvalidSeedState))?
-                .ok_or_else(|| self.fail_prf_validation(PrfValidationFailure::MissingSeedState))?;
-
-        if !user_verified && hmac_secret.cred_without_uv.is_none() {
-            return Err(self.fail_prf_validation(PrfValidationFailure::MissingNonUvSeed));
-        }
+        stored_hmac_secret_from_extension_state(credential.extension_state.as_ref())
+            .map_err(|_| self.fail_prf_validation(PrfValidationFailure::InvalidSeedState))?
+            .ok_or_else(|| self.fail_prf_validation(PrfValidationFailure::MissingSeedState))?;
 
         Ok(())
     }
@@ -855,8 +855,7 @@ impl passkey::authenticator::UserValidationMethod for UserValidationMethodImpl<'
         // increment its counter, persist it, calculate extension output, or sign.
         // If requested UV failed, passkey-rs must return OperationDenied first.
         if !requested_verification || result.user_verified {
-            self.authenticator
-                .validate_selected_prf_state(result.user_verified)?;
+            self.authenticator.validate_selected_prf_state()?;
         }
 
         Ok(UserCheck {
@@ -904,26 +903,52 @@ mod tests {
     use super::{Fido2Authenticator, GetAssertionError};
     use crate::{
         CheckUserOptions, CheckUserResult, Fido2CallbackError, Fido2CredentialStore,
-        Fido2UserInterface, GetAssertionExtensionsInput, GetAssertionPrfInput, PrfInputValues,
+        Fido2UserInterface, GetAssertionExtensionsInput, GetAssertionPrfInput,
+        MakeCredentialExtensionsInput, MakeCredentialPrfInput, MakeCredentialRequest,
+        PrfInputValues, PublicKeyCredentialRpEntity, PublicKeyCredentialUserEntity, Verification,
         guid_bytes_to_string, string_to_guid_bytes,
-        types::{GetAssertionRequest, Options, UV},
+        types::{GetAssertionRequest, Options, PublicKeyCredentialParameters, UV},
     };
 
     struct MockUserInterface {
         user_verified: bool,
+        creation_cipher: Option<CipherView>,
+        seen_verifications: Mutex<Vec<Verification>>,
     }
 
     impl MockUserInterface {
         fn verified() -> Self {
             Self {
                 user_verified: true,
+                creation_cipher: None,
+                seen_verifications: Mutex::new(Vec::new()),
             }
         }
 
         fn unverified() -> Self {
             Self {
                 user_verified: false,
+                creation_cipher: None,
+                seen_verifications: Mutex::new(Vec::new()),
             }
+        }
+
+        fn for_creation(cipher: CipherView, user_verified: bool) -> Self {
+            Self {
+                user_verified,
+                creation_cipher: Some(cipher),
+                seen_verifications: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn assert_last_verification_required(&self) {
+            assert!(matches!(
+                self.seen_verifications
+                    .lock()
+                    .expect("Mutex is not poisoned")
+                    .last(),
+                Some(Verification::Required)
+            ));
         }
     }
 
@@ -931,9 +956,13 @@ mod tests {
     impl Fido2UserInterface for MockUserInterface {
         async fn check_user<'a>(
             &self,
-            _options: CheckUserOptions,
+            options: CheckUserOptions,
             _hint: UiHint<'a, CipherView>,
         ) -> Result<CheckUserResult, Fido2CallbackError> {
+            self.seen_verifications
+                .lock()
+                .expect("Mutex is not poisoned")
+                .push(options.require_verification);
             Ok(CheckUserResult {
                 user_present: true,
                 user_verified: self.user_verified,
@@ -952,10 +981,23 @@ mod tests {
 
         async fn check_user_and_pick_credential_for_creation(
             &self,
-            _options: CheckUserOptions,
+            options: CheckUserOptions,
             _new_credential: Fido2CredentialNewView,
         ) -> Result<(CipherView, CheckUserResult), Fido2CallbackError> {
-            unimplemented!("not needed for this test")
+            self.seen_verifications
+                .lock()
+                .expect("Mutex is not poisoned")
+                .push(options.require_verification);
+            let cipher = self.creation_cipher.clone().ok_or_else(|| {
+                Fido2CallbackError::Unknown("creation cipher was not configured".to_string())
+            })?;
+            Ok((
+                cipher,
+                CheckUserResult {
+                    user_present: true,
+                    user_verified: self.user_verified,
+                },
+            ))
         }
 
         fn is_verification_enabled(&self) -> bool {
@@ -1078,6 +1120,35 @@ mod tests {
         }
     }
 
+    fn make_prf_request(uv: UV) -> MakeCredentialRequest {
+        MakeCredentialRequest {
+            client_data_hash: vec![0; 32],
+            rp: PublicKeyCredentialRpEntity {
+                id: TEST_FIDO_RP_ID.to_string(),
+                name: Some("Example".to_string()),
+            },
+            user: PublicKeyCredentialUserEntity {
+                id: b"new-user".to_vec(),
+                display_name: "New User".to_string(),
+                name: "new-user@example.com".to_string(),
+            },
+            pub_key_cred_params: vec![PublicKeyCredentialParameters {
+                ty: "public-key".to_string(),
+                alg: -7,
+            }],
+            exclude_list: None,
+            options: Options { rk: true, uv },
+            extensions: Some(MakeCredentialExtensionsInput {
+                prf: Some(MakeCredentialPrfInput {
+                    eval: Some(PrfInputValues {
+                        first: b"registration-prf".to_vec(),
+                        second: None,
+                    }),
+                }),
+            }),
+        }
+    }
+
     fn expected_prf(seed: &[u8], input: &[u8]) -> Vec<u8> {
         let hashed_input =
             passkey::types::crypto::sha256(&[b"WebAuthn PRF\0".as_slice(), input].concat());
@@ -1166,6 +1237,64 @@ mod tests {
             revision_date: "2024-01-30T17:55:36.150Z".parse().unwrap(),
             archived_date: None,
         }
+    }
+
+    #[tokio::test]
+    async fn test_make_credential_prf_eval_overrides_discouraged_to_required() {
+        let client = create_client();
+        initialize_user(&client).await;
+        let cipher = {
+            let mut ctx = client.internal.get_key_store().context();
+            create_test_cipher(&mut ctx)
+        };
+        let user_interface = MockUserInterface::for_creation(cipher.clone(), true);
+        let credential_store = MockCredentialStore::new(cipher);
+        let mut authenticator =
+            Fido2Authenticator::new(&client, &user_interface, &credential_store);
+
+        let result = authenticator
+            .make_credential(make_prf_request(UV::Discouraged))
+            .await
+            .unwrap();
+
+        user_interface.assert_last_verification_required();
+        let prf = result.extensions.prf.unwrap();
+        assert!(prf.enabled);
+        assert_eq!(prf.results.unwrap().first.len(), 32);
+
+        let saved = credential_store.saved_credentials();
+        assert_eq!(saved.len(), 1);
+        let key_store = client.internal.get_key_store();
+        let saved_view: CipherView = key_store.decrypt(&saved[0].cipher).unwrap();
+        let saved_credentials = saved_view
+            .get_fido2_credentials(&mut key_store.context())
+            .unwrap();
+        let state = saved_credentials[0].extension_state.as_ref().unwrap();
+        assert!(state.non_uv_hmac_seed.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_make_credential_prf_eval_fails_without_uv_before_persistence() {
+        let client = create_client();
+        initialize_user(&client).await;
+        let cipher = {
+            let mut ctx = client.internal.get_key_store().context();
+            create_test_cipher(&mut ctx)
+        };
+        let user_interface = MockUserInterface::for_creation(cipher.clone(), false);
+        let credential_store = MockCredentialStore::new(cipher);
+        let mut authenticator =
+            Fido2Authenticator::new(&client, &user_interface, &credential_store);
+
+        let error = authenticator
+            .make_credential(make_prf_request(UV::Discouraged))
+            .await
+            .err()
+            .unwrap();
+
+        user_interface.assert_last_verification_required();
+        assert!(error.to_string().contains("OperationDenied"));
+        assert!(credential_store.saved_credentials().is_empty());
     }
 
     /// UV PRF evaluation returns deterministic first and second outputs.
@@ -1432,7 +1561,7 @@ mod tests {
 
         let selected_input = b"credential-specific".to_vec();
         let request = prf_request(
-            UV::Preferred,
+            UV::Discouraged,
             Some(PrfInputValues {
                 first: b"fallback".to_vec(),
                 second: None,
@@ -1447,24 +1576,25 @@ mod tests {
         );
 
         let result = authenticator.get_assertion(request).await.unwrap();
+        user_interface.assert_last_verification_required();
         let output = result.extensions.prf.unwrap().results;
         assert_eq!(output.first, expected_prf(&[0x11; 32], &selected_input));
         assert_eq!(output.second, None);
     }
 
     #[tokio::test]
-    async fn test_prf_without_uv_uses_non_uv_seed() {
+    async fn test_prf_discouraged_request_is_overridden_to_uv() {
         let client = create_client();
         let cipher = {
             let mut ctx = client.internal.get_key_store().context();
             create_test_cipher_with_extension(&mut ctx, Some(extension_state(Some(vec![0x22; 32]))))
         };
-        let user_interface = MockUserInterface::unverified();
+        let user_interface = MockUserInterface::verified();
         let credential_store = MockCredentialStore::new(cipher);
         let mut authenticator =
             Fido2Authenticator::new(&client, &user_interface, &credential_store);
 
-        let first = b"non-uv".to_vec();
+        let first = b"forced-uv".to_vec();
         let request = prf_request(
             UV::Discouraged,
             Some(PrfInputValues {
@@ -1475,20 +1605,26 @@ mod tests {
         );
 
         let result = authenticator.get_assertion(request).await.unwrap();
+        user_interface.assert_last_verification_required();
         let output = result.extensions.prf.unwrap().results;
-        assert_eq!(output.first, expected_prf(&[0x22; 32], &first));
+        assert_eq!(output.first, expected_prf(&[0x11; 32], &first));
         assert_eq!(output.second, None);
+        assert_ne!(
+            result.authenticator_data[32] & 0x04,
+            0,
+            "UV flag must be set"
+        );
     }
 
     #[tokio::test]
-    async fn test_prf_without_uv_fails_before_persistence_when_non_uv_seed_is_missing() {
+    async fn test_prf_discouraged_request_fails_without_uv_before_persistence() {
         let client = create_client();
         initialize_user(&client).await;
         let cipher = {
             let mut ctx = client.internal.get_key_store().context();
             create_test_cipher_with_extension_and_counter(
                 &mut ctx,
-                Some(extension_state(None)),
+                Some(extension_state(Some(vec![0x22; 32]))),
                 "1",
             )
         };
@@ -1499,14 +1635,17 @@ mod tests {
         let request = prf_request(
             UV::Discouraged,
             Some(PrfInputValues {
-                first: b"missing-non-uv".to_vec(),
+                first: b"uv-must-succeed".to_vec(),
                 second: None,
             }),
             None,
         );
 
         let error = authenticator.get_assertion(request).await.err().unwrap();
-        assert!(matches!(error, GetAssertionError::PrfMissingNonUvSeed));
+        user_interface.assert_last_verification_required();
+        assert!(
+            matches!(error, GetAssertionError::Other(message) if message.contains("OperationDenied"))
+        );
         assert!(credential_store.saved_credentials().is_empty());
     }
 

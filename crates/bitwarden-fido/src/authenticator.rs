@@ -11,7 +11,7 @@ use passkey::{
     },
     types::{
         Passkey,
-        ctap2::{self, Ctap2Error, StatusCode, VendorError},
+        ctap2::{self, Ctap2Code, Ctap2Error, StatusCode, VendorError},
     },
 };
 use thiserror::Error;
@@ -63,6 +63,12 @@ pub enum GetAssertionError {
     InvalidGuid(#[from] InvalidGuidError),
     #[error("missing user")]
     MissingUser,
+    /// PRF was requested (UV required) but the credential has no UV HMAC seed.
+    #[error("PRF evaluation failed: UV seed required but not present in credential extension state")]
+    PrfMissingUvSeed,
+    /// PRF was requested but the credential has no HMAC seed state at all.
+    #[error("PRF evaluation failed: no HMAC seed state present in credential")]
+    PrfMissingSeedState,
     #[error("get_assertion error: {0}")]
     Other(String),
 }
@@ -236,13 +242,36 @@ impl<'a> Fido2Authenticator<'a> {
 
         let response = match response {
             Ok(x) => x,
-            Err(e) => return Err(GetAssertionError::Other(format!("{e:?}"))),
+            Err(e) => {
+                // Map passkey-rs PRF-related errors to specific GetAssertionError variants
+                // so callers can distinguish PRF seed failures from other authenticator errors.
+                // UserVerificationBlocked is returned when UV is required but the credential
+                // has no non-UV HMAC seed (cred_without_uv is None).
+                if matches!(
+                    e,
+                    StatusCode::Ctap2(Ctap2Code::Known(
+                        passkey::types::ctap2::Ctap2Error::UserVerificationBlocked
+                    ))
+                ) {
+                    return Err(GetAssertionError::PrfMissingUvSeed);
+                }
+                return Err(GetAssertionError::Other(format!("{e:?}")));
+            }
         };
 
         let selected_credential = self.get_selected_credential()?;
         let authenticator_data = response.auth_data.to_vec();
         let credential_id = string_to_guid_bytes(&selected_credential.credential.credential_id)?;
         let extensions = response.unsigned_extension_outputs.into();
+
+        // Enforce UV seed selection and PRF output semantics (fail closed).
+        // If PRF was requested but the selected credential has no extension_state
+        // (no HMAC seeds at all), fail closed with a specific error.
+        if request.extensions.as_ref().is_some_and(|ext| ext.prf.is_some())
+            && selected_credential.credential.extension_state.is_none()
+        {
+            return Err(GetAssertionError::PrfMissingSeedState);
+        }
 
         Ok(GetAssertionResult {
             credential_id,
@@ -1077,6 +1106,174 @@ mod tests {
         assert!(
             result.extensions.prf.is_some(),
             "PRF should be evaluated when extension_state contains UV-only HMAC seed"
+        );
+    }
+
+    /// PRF requested but credential has no extension_state → fail closed with PrfMissingSeedState.
+    #[tokio::test]
+    async fn test_prf_fails_closed_when_no_seed_state() {
+        let client = Client::new(None);
+        let user_key: SymmetricCryptoKey =
+            "w2LO+nwV4oxwswVYCxlOfRUseXfvU03VzvKQHrqeklPgiMZrspUe6sOBToCnDn9Ay0tuCBn8ykVVRb7PWhub2Q=="
+                .to_string()
+                .try_into()
+                .unwrap();
+
+        #[allow(deprecated)]
+        client
+            .internal
+            .get_key_store()
+            .context_mut()
+            .set_symmetric_key(SymmetricKeySlotId::User, user_key)
+            .unwrap();
+
+        // No extension_state — no HMAC seeds
+        let cipher = {
+            let mut ctx = client.internal.get_key_store().context();
+            create_test_cipher(&mut ctx)
+        };
+
+        let user_interface = MockUserInterface;
+        let credential_store = MockCredentialStore { cipher };
+        let mut authenticator =
+            Fido2Authenticator::new(&client, &user_interface, &credential_store);
+
+        let prf_salt = passkey::types::crypto::sha256("nuri-prf-salt-v1".as_bytes()).to_vec();
+        let request = GetAssertionRequest {
+            rp_id: "example.com".to_string(),
+            client_data_hash: vec![0u8; 32],
+            allow_list: None,
+            options: Options {
+                rk: false,
+                uv: UV::Preferred,
+            },
+            extensions: Some(GetAssertionExtensionsInput {
+                prf: Some(GetAssertionPrfInput {
+                    eval: Some(PrfInputValues {
+                        first: prf_salt,
+                        second: None,
+                    }),
+                    eval_by_credential: None,
+                }),
+            }),
+        };
+
+        let result = authenticator.get_assertion(request).await;
+        assert!(
+            matches!(result, Err(GetAssertionError::PrfMissingSeedState)),
+            "Should fail closed with PrfMissingSeedState when no extension_state, got: {:?}",
+            result
+        );
+    }
+
+    /// PRF NOT requested → no PRF output returned, even with extension_state present.
+    #[tokio::test]
+    async fn test_no_prf_output_when_not_requested() {
+        let client = Client::new(None);
+        let user_key: SymmetricCryptoKey =
+            "w2LO+nwV4oxwswVYCxlOfRUseXfvU03VzvKQHrqeklPgiMZrspUe6sOBToCnDn9Ay0tuCBn8ykVVRb7PWhub2Q=="
+                .to_string()
+                .try_into()
+                .unwrap();
+
+        #[allow(deprecated)]
+        client
+            .internal
+            .get_key_store()
+            .context_mut()
+            .set_symmetric_key(SymmetricKeySlotId::User, user_key)
+            .unwrap();
+
+        let uv_seed = B64Url::from(vec![0x11u8; 32]).to_string();
+        let non_uv_seed = B64Url::from(vec![0x22u8; 32]).to_string();
+        let extension_state = Fido2ExtensionStateView {
+            prf_hmac_algorithm: "hmac-secret".to_string(),
+            uv_hmac_seed: uv_seed,
+            non_uv_hmac_seed: Some(non_uv_seed),
+            cred_blob: None,
+            large_blob: None,
+            key_algorithm_metadata: "ES256".to_string(),
+        };
+
+        let cipher = {
+            let mut ctx = client.internal.get_key_store().context();
+            create_test_cipher_with_extension(&mut ctx, Some(extension_state))
+        };
+
+        let user_interface = MockUserInterface;
+        let credential_store = MockCredentialStore { cipher };
+        let mut authenticator =
+            Fido2Authenticator::new(&client, &user_interface, &credential_store);
+
+        // No PRF extension requested
+        let request = GetAssertionRequest {
+            rp_id: "example.com".to_string(),
+            client_data_hash: vec![0u8; 32],
+            allow_list: None,
+            options: Options {
+                rk: false,
+                uv: UV::Preferred,
+            },
+            extensions: None,
+        };
+
+        let result = authenticator.get_assertion(request).await.unwrap();
+        assert_eq!(
+            TEST_FIDO_CREDENTIAL_ID,
+            guid_bytes_to_string(&result.credential_id).unwrap()
+        );
+        assert!(
+            result.extensions.prf.is_none(),
+            "PRF output should not be present when PRF was not requested"
+        );
+    }
+
+    /// PRF requested with extensions but prf field is None → no PRF output, no failure.
+    #[tokio::test]
+    async fn test_no_prf_output_when_prf_field_is_none() {
+        let client = Client::new(None);
+        let user_key: SymmetricCryptoKey =
+            "w2LO+nwV4oxwswVYCxlOfRUseXfvU03VzvKQHrqeklPgiMZrspUe6sOBToCnDn9Ay0tuCBn8ykVVRb7PWhub2Q=="
+                .to_string()
+                .try_into()
+                .unwrap();
+
+        #[allow(deprecated)]
+        client
+            .internal
+            .get_key_store()
+            .context_mut()
+            .set_symmetric_key(SymmetricKeySlotId::User, user_key)
+            .unwrap();
+
+        let cipher = {
+            let mut ctx = client.internal.get_key_store().context();
+            create_test_cipher(&mut ctx)
+        };
+
+        let user_interface = MockUserInterface;
+        let credential_store = MockCredentialStore { cipher };
+        let mut authenticator =
+            Fido2Authenticator::new(&client, &user_interface, &credential_store);
+
+        // Extensions present but prf is None
+        let request = GetAssertionRequest {
+            rp_id: "example.com".to_string(),
+            client_data_hash: vec![0u8; 32],
+            allow_list: None,
+            options: Options {
+                rk: false,
+                uv: UV::Preferred,
+            },
+            extensions: Some(GetAssertionExtensionsInput {
+                prf: None,
+            }),
+        };
+
+        let result = authenticator.get_assertion(request).await.unwrap();
+        assert!(
+            result.extensions.prf.is_none(),
+            "PRF output should not be present when prf field is None"
         );
     }
 }

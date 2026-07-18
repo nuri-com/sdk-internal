@@ -3,6 +3,9 @@ set -eo pipefail
 
 cd "$(dirname "$0")"
 
+SDK_REPO_ROOT="$(git rev-parse --show-toplevel)"
+GENERATED_DIR="./Sources/BitwardenSdk"
+
 # Generate an xcframework for the Swift bindings.
 
 # Cleanup dirs
@@ -39,7 +42,12 @@ cargo run -p uniffi-bindgen generate \
   --out-dir tmp/bindings
 
 # Move generated swift bindings
-mv ./tmp/bindings/*.swift ./Sources/BitwardenSdk/
+# UniFFI does not remove source files for modules that disappear. Clear only generated Swift files
+# so every SDK build reflects the current native library exactly.
+find "$GENERATED_DIR" -maxdepth 1 -type f -name '*.swift' -delete
+mv ./tmp/bindings/*.swift "$GENERATED_DIR/"
+
+"$SDK_REPO_ROOT/support/verify-portable-passkey-bindings.sh" swift "$GENERATED_DIR"
 
 # Massage the generated files to fit xcframework
 mkdir tmp/Headers

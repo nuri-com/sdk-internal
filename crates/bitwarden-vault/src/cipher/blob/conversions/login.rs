@@ -366,6 +366,41 @@ mod tests {
     }
 
     #[test]
+    fn test_fido2_blob_debug_redacts_private_key_and_hmac_seeds() {
+        let extension_state = test_extension_state();
+        let uv_seed = extension_state.uv_hmac_seed.clone();
+        let non_uv_seed = extension_state
+            .non_uv_hmac_seed
+            .clone()
+            .expect("test state should contain a non-UV seed");
+        let private_key = "private-key-sentinel";
+        let full_view = Fido2CredentialFullView {
+            credential_id: "cred-id".to_string(),
+            key_type: "public-key".to_string(),
+            key_algorithm: "ECDSA".to_string(),
+            key_curve: "P-256".to_string(),
+            key_value: private_key.to_string(),
+            rp_id: "nuri.com".to_string(),
+            user_handle: None,
+            user_name: None,
+            counter: "0".to_string(),
+            rp_name: None,
+            user_display_name: None,
+            discoverable: "true".to_string(),
+            creation_date: Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+            extension_state: Some(extension_state),
+        };
+
+        let data = super::Fido2CredentialDataV1::from(&full_view);
+        let debug = format!("{data:?}");
+
+        assert!(!debug.contains(private_key));
+        assert!(!debug.contains(&uv_seed));
+        assert!(!debug.contains(&non_uv_seed));
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
     fn test_fido2_extension_state_none_remains_none_through_blob() {
         let full_view = Fido2CredentialFullView {
             credential_id: "cred-id".to_string(),

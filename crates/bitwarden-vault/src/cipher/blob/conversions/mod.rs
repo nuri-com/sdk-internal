@@ -1,5 +1,6 @@
 use bitwarden_core::key_management::{KeySlotIds, SymmetricKeySlotId};
 use bitwarden_crypto::{CompositeEncryptable, CryptoError, Decryptable, KeyStoreContext};
+use zeroize::Zeroizing;
 
 use super::v1::*;
 use crate::{
@@ -74,6 +75,7 @@ impl CipherBlobV1 {
                     .as_ref()
                     .map(|creds| -> Result<Vec<_>, CryptoError> {
                         let full_views: Vec<Fido2CredentialFullView> = creds.decrypt(ctx, key)?;
+                        let full_views = Zeroizing::new(full_views);
                         Ok(full_views.iter().map(Fido2CredentialDataV1::from).collect())
                     })
                     .transpose()?
@@ -191,11 +193,13 @@ impl CipherBlobV1 {
                 let fido2_credentials = if login_data.fido2_credentials.is_empty() {
                     None
                 } else {
-                    let full_views: Vec<Fido2CredentialFullView> = login_data
-                        .fido2_credentials
-                        .iter()
-                        .map(Fido2CredentialFullView::from)
-                        .collect();
+                    let full_views = Zeroizing::new(
+                        login_data
+                            .fido2_credentials
+                            .iter()
+                            .map(Fido2CredentialFullView::from)
+                            .collect::<Vec<_>>(),
+                    );
                     Some(full_views.encrypt_composite(ctx, key)?)
                 };
 

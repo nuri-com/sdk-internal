@@ -853,6 +853,7 @@ dependencies = [
  "bitwarden-vault",
  "chrono",
  "coset",
+ "data-encoding",
  "itertools 0.14.0",
  "p256 0.13.2",
  "passkey",
@@ -865,6 +866,7 @@ dependencies = [
  "tracing",
  "uniffi",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -1469,6 +1471,7 @@ dependencies = [
  "serde_repr",
  "sha1",
  "sha2 0.11.0",
+ "static_assertions",
  "subtle",
  "thiserror 2.0.18",
  "tokio",
@@ -1480,6 +1483,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wiremock",
+ "zeroize",
  "zxcvbn",
 ]
 

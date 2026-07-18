@@ -16,6 +16,7 @@ use passkey::{
 };
 use thiserror::Error;
 use tracing::error;
+use zeroize::Zeroizing;
 
 use super::{
     AAGUID, CheckUserOptions, CipherViewContainer, Fido2CredentialStore, Fido2UserInterface,
@@ -470,6 +471,7 @@ impl<'a> Fido2Authenticator<'a> {
         let credentials = selected_cipher
             .get_fido2_credentials(&mut key_store.context())
             .map_err(|_| self.fail_prf_validation(PrfValidationFailure::InvalidSeedState))?;
+        let credentials = Zeroizing::new(credentials);
         let credential = credentials
             .first()
             .ok_or_else(|| self.fail_prf_validation(PrfValidationFailure::InvalidSeedState))?;

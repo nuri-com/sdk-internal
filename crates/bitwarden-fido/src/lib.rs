@@ -8,6 +8,7 @@ use bitwarden_vault::{
     Fido2ExtensionStateView,
 };
 use crypto::{CoseKeyToPkcs8Error, PrivateKeyFromSecretKeyError};
+use data_encoding::BASE64URL_NOPAD;
 use passkey::types::{CredentialExtensions, Passkey, StoredHmacSecret, ctap2::Aaguid};
 
 #[cfg(feature = "uniffi")]
@@ -49,6 +50,7 @@ pub use types::{
     PublicKeyCredentialAuthenticatorAttestationResponse, PublicKeyCredentialRpEntity,
     PublicKeyCredentialUserEntity, UnverifiedAssetLink,
 };
+use zeroize::{Zeroize, Zeroizing};
 
 use self::crypto::{cose_key_to_pkcs8, pkcs8_to_cose_key};
 
@@ -80,6 +82,12 @@ impl CipherViewContainer {
             cipher,
             fido2_credentials,
         })
+    }
+}
+
+impl Drop for CipherViewContainer {
+    fn drop(&mut self) {
+        self.fido2_credentials.zeroize();
     }
 }
 
@@ -157,6 +165,9 @@ pub(crate) fn stored_hmac_secret_from_extension_state(
         .map(|seed| decode_hmac_seed("non-UV", seed))
         .transpose()?;
 
+    // These decoded vectors move directly into passkey-rs' `StoredHmacSecret`, which implements
+    // `ZeroizeOnDrop`. Wrapping and then extracting them here would only create a false sense of
+    // protection by returning the same allocation without a drop guard.
     Ok(Some(StoredHmacSecret {
         cred_with_uv,
         cred_without_uv,
@@ -164,15 +175,26 @@ pub(crate) fn stored_hmac_secret_from_extension_state(
 }
 
 fn try_from_credential_full_view(value: Fido2CredentialFullView) -> Result<Passkey, Fido2Error> {
+    let mut value = Zeroizing::new(value);
     let counter: u32 = value
         .counter
         .parse()
         .map_err(|_| Fido2Error::InvalidCounter)?;
     let counter = (counter != 0).then_some(counter);
-    let key_value = B64Url::try_from(value.key_value)?;
-    let user_handle = value.user_handle.map(B64Url::try_from).transpose()?;
+    let encoded_private_key = Zeroizing::new(std::mem::take(&mut value.key_value));
+    let private_key = Zeroizing::new(B64Url::try_from(encoded_private_key.as_str())?.into_bytes());
+    let user_handle = value
+        .user_handle
+        .as_deref()
+        .map(B64Url::try_from)
+        .transpose()?;
 
-    let key = pkcs8_to_cose_key(key_value.as_bytes())?;
+    let key = pkcs8_to_cose_key(private_key.as_slice())?;
+
+    // `CoseKey` owns the long-lived private scalar. passkey-rs cannot currently implement
+    // `Zeroize` for that type, so default SDK builds rely on bitwarden-crypto's global
+    // `ZeroizingAllocator` to clear its heap allocation when it is released. The encoded and
+    // decoded temporary buffers above remain explicitly guarded.
 
     let hmac_secret = stored_hmac_secret_from_extension_state(value.extension_state.as_ref())?;
 
@@ -234,11 +256,11 @@ fn extension_state_from_hmac_secret(
         prf_hmac_algorithm: existing
             .map(|state| state.prf_hmac_algorithm.clone())
             .unwrap_or_else(|| "hmac-secret".to_string()),
-        uv_hmac_seed: B64Url::from(hmac_secret.cred_with_uv.clone()).to_string(),
+        uv_hmac_seed: BASE64URL_NOPAD.encode(&hmac_secret.cred_with_uv),
         non_uv_hmac_seed: hmac_secret
             .cred_without_uv
             .as_ref()
-            .map(|seed| B64Url::from(seed.clone()).to_string()),
+            .map(|seed| BASE64URL_NOPAD.encode(seed)),
         cred_blob: existing.and_then(|state| state.cred_blob.clone()),
         large_blob: existing.and_then(|state| state.large_blob.clone()),
         key_algorithm_metadata: existing
@@ -256,7 +278,8 @@ pub(crate) fn fill_with_credential_preserving_extension_state(
     let user_handle = value
         .user_handle
         .map(|u| B64Url::from(u.to_vec()).to_string());
-    let key_value = B64Url::from(cose_key_to_pkcs8(&value.key)?).to_string();
+    let private_key = cose_key_to_pkcs8(&value.key)?;
+    let key_value = BASE64URL_NOPAD.encode(private_key.as_slice());
 
     // Derive key algorithm and curve from the COSE key instead of hardcoding ECDSA/P-256.
     let (key_algorithm, key_curve) = derive_algorithm_from_cose_key(&value.key)?;
@@ -383,7 +406,8 @@ pub(crate) fn try_from_credential_full(
     options: passkey::types::ctap2::get_assertion::Options,
 ) -> Result<Fido2CredentialFullView, FillCredentialError> {
     let cred_id: Vec<u8> = value.credential_id.into();
-    let key_value = B64Url::from(cose_key_to_pkcs8(&value.key)?).to_string();
+    let private_key = cose_key_to_pkcs8(&value.key)?;
+    let key_value = BASE64URL_NOPAD.encode(private_key.as_slice());
     let user_handle = B64Url::from(user.id.to_vec()).to_string();
 
     let (key_algorithm, key_curve) = derive_algorithm_from_cose_key(&value.key)?;
@@ -570,6 +594,27 @@ mod tests {
             passkey.extensions.hmac_secret.is_none(),
             "hmac_secret should be None when extension_state is None"
         );
+    }
+
+    #[test]
+    fn debug_redacts_private_key_and_hmac_seeds() {
+        let state = extension_state();
+        let uv_seed = state.uv_hmac_seed.clone();
+        let non_uv_seed = state
+            .non_uv_hmac_seed
+            .clone()
+            .expect("test state should contain a non-UV seed");
+
+        let state_debug = format!("{state:?}");
+        assert!(!state_debug.contains(&uv_seed));
+        assert!(!state_debug.contains(&non_uv_seed));
+        assert!(state_debug.contains("<redacted>"));
+
+        let view_debug = format!("{:?}", full_view(Some(state)));
+        assert!(!view_debug.contains(TEST_KEY_VALUE));
+        assert!(!view_debug.contains(&uv_seed));
+        assert!(!view_debug.contains(&non_uv_seed));
+        assert!(view_debug.contains("<redacted>"));
     }
 
     #[test]

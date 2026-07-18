@@ -6,6 +6,7 @@ use credential_exchange_format::{
     PasskeyCredential, PassportCredential, PersonNameCredential, SshKeyCredential, TotpCredential,
     WifiCredential,
 };
+use zeroize::Zeroizing;
 
 use crate::{
     CipherType, Field, ImportingCipher, SecureNote, SecureNoteType,
@@ -29,7 +30,8 @@ use crate::{
  * Parse CXF payload in the format compatible with Apple (At the Account-level)
  */
 pub(crate) fn parse_cxf(payload: String) -> Result<Vec<ImportingCipher>, CxfError> {
-    let account: CxfAccount = serde_json::from_str(&payload)?;
+    let payload = Zeroizing::new(payload);
+    let account: CxfAccount = serde_json::from_str(payload.as_str())?;
 
     let mut items = Vec::new();
     for item in account.items {

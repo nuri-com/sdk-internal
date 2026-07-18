@@ -14,6 +14,7 @@ use credential_exchange_format::{
 };
 use p256::{SecretKey, pkcs8::DecodePrivateKey};
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 use crate::{Fido2Credential, Field, Login, LoginUri};
 
@@ -132,7 +133,7 @@ fn extensions_to_state_json(
     validate_seed("credWithUV", hmac.cred_with_uv.as_ref())?;
     validate_seed("credWithoutUV", hmac.cred_without_uv.as_ref())?;
 
-    let state = Fido2ExtensionStateView {
+    let state = Zeroizing::new(Fido2ExtensionStateView {
         // This is Bitwarden's established name for the CTAP hmac-secret/PRF capability.
         prf_hmac_algorithm: "hmac-secret".to_string(),
         uv_hmac_seed: hmac.cred_with_uv.to_string(),
@@ -144,8 +145,8 @@ fn extensions_to_state_json(
             .map(serde_json::to_string)
             .transpose()?,
         key_algorithm_metadata: key_algorithm_metadata.to_string(),
-    };
-    Ok(Some(serde_json::to_string(&state)?))
+    });
+    Ok(Some(serde_json::to_string(&*state)?))
 }
 
 fn validate_seed(seed_name: &'static str, seed: &[u8]) -> Result<(), PasskeyImportError> {

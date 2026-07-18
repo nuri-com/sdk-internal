@@ -1,5 +1,8 @@
+use std::fmt;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::cipher::{
     field::FieldType,
@@ -60,7 +63,7 @@ pub(crate) struct LoginUriDataV1 {
     pub r#match: Option<UriMatchType>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Fido2CredentialDataV1 {
     pub credential_id: String,
@@ -80,6 +83,36 @@ pub(crate) struct Fido2CredentialDataV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extension_state: Option<Fido2ExtensionStateView>,
 }
+
+impl fmt::Debug for Fido2CredentialDataV1 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Fido2CredentialDataV1")
+            .field("key_type", &self.key_type)
+            .field("key_algorithm", &self.key_algorithm)
+            .field("key_curve", &self.key_curve)
+            .field("key_value", &"<redacted>")
+            .field("counter", &self.counter)
+            .field("discoverable", &self.discoverable)
+            .field("creation_date", &self.creation_date)
+            .field("extension_state", &self.extension_state)
+            .finish()
+    }
+}
+
+impl Zeroize for Fido2CredentialDataV1 {
+    fn zeroize(&mut self) {
+        self.key_value.zeroize();
+        self.extension_state.zeroize();
+    }
+}
+
+impl Drop for Fido2CredentialDataV1 {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for Fido2CredentialDataV1 {}
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]

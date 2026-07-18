@@ -90,6 +90,11 @@ case "$binding_type" in
     require_literal "$fido_file" 'data class ClientExtensionResults ('
     require_literal "$fido_file" 'val `prf`: ClientPrfOutput?'
     require_literal "$fido_file" 'data class ClientPrfOutput ('
+    require_literal "$fido_file" 'val `enabled`: kotlin.Boolean?'
+    require_literal "$fido_file" 'val `results`: PrfOutputValues?'
+    require_literal "$fido_file" 'data class PrfOutputValues ('
+    require_literal "$fido_file" 'val `first`: kotlin.ByteArray'
+    require_literal "$fido_file" 'val `second`: kotlin.ByteArray?'
     require_literal "$fido_file" 'val `alreadyHashed`: kotlin.Boolean'
     verify_no_decoded_extension_state "$vault_file" "$fido_file"
     ;;
@@ -104,6 +109,11 @@ case "$binding_type" in
     require_literal "$fido_file" 'public struct ClientExtensionResults:'
     require_literal "$fido_file" 'public let prf: ClientPrfOutput?'
     require_literal "$fido_file" 'public struct ClientPrfOutput:'
+    require_literal "$fido_file" 'public let enabled: Bool?'
+    require_literal "$fido_file" 'public let results: PrfOutputValues?'
+    require_literal "$fido_file" 'public struct PrfOutputValues:'
+    require_literal "$fido_file" 'public let first: Data'
+    require_literal "$fido_file" 'public let second: Data?'
     require_literal "$fido_file" 'public let alreadyHashed: Bool'
     verify_no_decoded_extension_state "$vault_file" "$fido_file"
     ;;

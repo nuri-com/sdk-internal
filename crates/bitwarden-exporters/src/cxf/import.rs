@@ -31,7 +31,11 @@ use crate::{
  */
 pub(crate) fn parse_cxf(payload: String) -> Result<Vec<ImportingCipher>, CxfError> {
     let payload = Zeroizing::new(payload);
-    let account: CxfAccount = serde_json::from_str(payload.as_str())?;
+    let mut value: serde_json::Value = serde_json::from_str(payload.as_str())?;
+    sanitize_negative_timestamps(&mut value);
+    // Re-serialize so `B64Url` keeps its borrowed-string deserialization.
+    let sanitized = Zeroizing::new(value.to_string());
+    let account: CxfAccount = serde_json::from_str(sanitized.as_str())?;
 
     let mut items = Vec::new();
     for item in account.items {
@@ -39,6 +43,31 @@ pub(crate) fn parse_cxf(payload: String) -> Result<Vec<ImportingCipher>, CxfErro
     }
 
     Ok(items)
+}
+
+/// Drop negative timestamp values before deserialization.
+///
+/// Google Password Manager (via Chrome) exports unset dates as its internal
+/// 1601 epoch zero naively converted to Unix time, e.g. `-11644473600`, which
+/// fails the CXF `u64` types. Treat those as "no date set" so the existing
+/// `convert_date` fallback applies. See nuri-com/bitwarden-passkey-prf#86.
+fn sanitize_negative_timestamps(value: &mut serde_json::Value) {
+    const TIMESTAMP_KEYS: [&str; 3] = ["creationAt", "modifiedAt", "timestamp"];
+    match value {
+        serde_json::Value::Object(map) => {
+            for key in TIMESTAMP_KEYS {
+                if matches!(
+                    map.get(key),
+                    Some(serde_json::Value::Number(n)) if n.as_i64().is_some_and(|v| v < 0)
+                ) {
+                    map.remove(key);
+                }
+            }
+            map.values_mut().for_each(sanitize_negative_timestamps);
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(sanitize_negative_timestamps),
+        _ => {}
+    }
 }
 
 /// Convert a CXF timestamp to a [`DateTime<Utc>`].
@@ -322,6 +351,48 @@ mod tests {
     use credential_exchange_format::{B64Url, CreditCardCredential, EditableFieldYearMonth};
 
     use super::*;
+
+    #[test]
+    fn test_sanitize_negative_timestamps() {
+        let mut value = serde_json::json!({
+            "timestamp": -11644473600i64,
+            "items": [
+                { "creationAt": -11644473600i64, "modifiedAt": 1732182026i64 },
+                { "creationAt": 1732181986i64 }
+            ]
+        });
+        sanitize_negative_timestamps(&mut value);
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "items": [
+                    { "modifiedAt": 1732182026i64 },
+                    { "creationAt": 1732181986i64 }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_cxf_with_negative_timestamps() {
+        let payload = serde_json::json!({
+            "id": "Njk1RERENTItNkQ0Ny00NERBLTlFN0EtNDM1MjNEQjYzNjVF",
+            "username": "pj-fry",
+            "email": "pj-fry@example.com",
+            "collections": [],
+            "items": [{
+                "id": "Njk1RERENTItNkQ0Ny00NERBLTlFN0EtNDM1MjNEQjYzNjVF",
+                "creationAt": -11644473600i64,
+                "modifiedAt": -11644473600i64,
+                "title": "example.com",
+                "credentials": []
+            }]
+        })
+        .to_string();
+        // Must not fail deserialization; negative dates fall back to now.
+        let ciphers = parse_cxf(payload).unwrap();
+        assert_eq!(ciphers.len(), 0);
+    }
 
     #[test]
     fn test_convert_date() {

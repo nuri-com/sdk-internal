@@ -122,6 +122,28 @@ impl CiphersClient {
         })
     }
 
+    /// Explicitly encrypt a personal cipher as an opaque blob.
+    ///
+    /// This narrowly supports credential exchange on updated clients when the account-wide blob
+    /// rollout gate is not yet enabled. Callers must fail closed if the resulting `Cipher.data`
+    /// is absent and must not use this for organization ciphers.
+    pub async fn encrypt_blob(
+        &self,
+        cipher_view: CipherView,
+    ) -> Result<EncryptionContext, EncryptError> {
+        let user_id = self
+            .client
+            .internal
+            .get_user_id()
+            .ok_or(EncryptError::MissingUserId)?;
+        let key_store = self.client.internal.get_key_store();
+        let cipher = key_store.encrypt(EncryptMode::Blob(cipher_view))?;
+        Ok(EncryptionContext {
+            cipher,
+            encrypted_for: user_id,
+        })
+    }
+
     /// Encrypt a cipher with the provided key. This should only be used when rotating encryption
     /// keys in the Web client.
     ///
@@ -425,7 +447,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "wasm")]
     fn test_cipher_view() -> CipherView {
         let test_id = "fd411a1a-fec8-4070-985d-0e6560860e69".parse().unwrap();
         CipherView {
@@ -924,6 +945,21 @@ mod tests {
         for ctx in contexts {
             assert_eq!(ctx.encrypted_for, expected_user_id);
         }
+    }
+
+    #[tokio::test]
+    async fn encrypt_blob_forces_blob_below_account_threshold() {
+        let client = Client::init_test_account(test_bitwarden_com_account()).await;
+
+        let encrypted = client
+            .vault()
+            .ciphers()
+            .encrypt_blob(test_cipher_view())
+            .await
+            .unwrap();
+
+        assert!(encrypted.cipher.data.is_some());
+        assert!(encrypted.cipher.login.is_none());
     }
 
     #[tokio::test]

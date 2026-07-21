@@ -18,6 +18,11 @@ impl CiphersClient {
         Ok(self.0.encrypt(cipher_view).await?)
     }
 
+    /// Force blob encryption for a portable personal credential import.
+    pub async fn encrypt_blob(&self, cipher_view: CipherView) -> Result<EncryptionContext> {
+        Ok(self.0.encrypt_blob(cipher_view).await?)
+    }
+
     /// Decrypt cipher
     pub async fn decrypt(&self, cipher: Cipher) -> Result<CipherView> {
         Ok(self.0.decrypt(cipher).await?)

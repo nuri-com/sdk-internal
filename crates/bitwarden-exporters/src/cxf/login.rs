@@ -70,9 +70,6 @@ pub(crate) enum PasskeyImportError {
     #[error("Secure-payment-confirmation extension import is not supported")]
     UnsupportedPaymentsExtension,
 
-    #[error("credBlob/largeBlob import without HMAC credentials is not supported")]
-    ExtensionStateWithoutHmacCredentials,
-
     #[error("Unable to serialize FIDO2 extension state: {0}")]
     SerializeExtensionState(#[from] serde_json::Error),
 }
@@ -117,11 +114,13 @@ fn extensions_to_state_json(
         return Err(PasskeyImportError::UnsupportedPaymentsExtension);
     }
     let Some(hmac) = ext.hmac_credentials.as_ref() else {
-        return if ext.cred_blob.is_some() || ext.large_blob.is_some() {
-            Err(PasskeyImportError::ExtensionStateWithoutHmacCredentials)
-        } else {
-            Ok(None)
-        };
+        // Google Password Manager exports credBlob/largeBlob without
+        // hmacCredentials. Without HMAC seeds there is no PRF state to
+        // preserve and Bitwarden's provider serves neither blob extension,
+        // so import the passkey usable-as-is instead of failing the vault
+        // import. ponytail: blobs are dropped here; preserve them in
+        // extension state if a blob-serving provider ever lands.
+        return Ok(None);
     };
 
     match &hmac.algorithm {
@@ -1023,18 +1022,20 @@ mod tests {
     }
 
     #[test]
-    fn test_to_login_rejects_unrepresentable_extension_state() {
+    fn test_to_login_imports_blob_only_extensions_without_state() {
+        // GPM real-world payload shape: credBlob/largeBlob, no hmacCredentials.
         let extensions = Fido2Extensions {
             cred_blob: Some(B64Url::from(b"credential-blob".as_slice())),
             ..Default::default()
         };
         let passkey = build_passkey_with_extensions(extensions);
 
-        let error = to_login(Utc::now(), None, Some(&passkey), None, None).unwrap_err();
-        assert!(matches!(
-            error,
-            PasskeyImportError::ExtensionStateWithoutHmacCredentials
-        ));
+        let login = to_login(Utc::now(), None, Some(&passkey), None, None).unwrap();
+        assert!(
+            login.fido2_credentials.unwrap()[0]
+                .extension_state
+                .is_none()
+        );
     }
 
     #[test]
